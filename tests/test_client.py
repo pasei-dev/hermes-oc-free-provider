@@ -717,11 +717,10 @@ class ClientTests(unittest.TestCase):
             }
         )
         with mock.patch.object(client, "_urlopen", return_value=response):
-            result = oc.chat.completions.create(model="m", messages=[], tools=[])
             with self.assertRaisesRegex(
                 client.OpenCodeError, "compatibility-only tool 'bash'"
             ):
-                _ = result.choices
+                oc.chat.completions.create(model="m", messages=[], tools=[])
 
     def test_http_error_exposes_status_code(self):
         error = urllib.error.HTTPError(  # type: ignore[arg-type]
@@ -729,9 +728,8 @@ class ClientTests(unittest.TestCase):
         )
         oc = client.OpenCodeClient()
         with mock.patch.object(client, "_urlopen", side_effect=error):
-            result = oc.chat.completions.create(model="m", messages=[], tools=[])
             with self.assertRaises(client.OpenCodeError) as caught:
-                _ = result.choices
+                oc.chat.completions.create(model="m", messages=[], tools=[])
         self.assertEqual(caught.exception.status_code, 429)
 
     def test_empty_and_content_filtered_responses_fail_explicitly(self):
@@ -783,9 +781,8 @@ class ClientTests(unittest.TestCase):
         oc = client.OpenCodeClient()
         oc.close()
         with mock.patch.object(client, "_urlopen") as open_request:
-            result = oc.chat.completions.create(model="m", messages=[])
             with self.assertRaisesRegex(client.OpenCodeError, "client is closed"):
-                _ = result.choices
+                oc.chat.completions.create(model="m", messages=[])
         open_request.assert_not_called()
 
     def test_catalog_intersects_live_zero_cost_tool_models(self):

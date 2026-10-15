@@ -1064,26 +1064,27 @@ def _next_or_done(iterator: Iterator[Any]) -> tuple[bool, Any]:
         return False, None
 
 
-class _LazyValue:
-    def __init__(self, factory):
-        self._factory = factory
-        self._value = None
-        self._ready = False
-        self._lock = threading.Lock()
+class _ResponseHandle:
+    """An already-fetched response that the async contract can still await.
 
-    def _resolve(self):
-        if not self._ready:
-            with self._lock:
-                if not self._ready:
-                    self._value = self._factory()
-                    self._ready = True
-        return self._value
+    ``create()`` performs the request eagerly and hands back the parsed response
+    wrapped here; the wrapper exists only so ``await client.chat.completions.create(...)``
+    works (the async client contract), and delegates every attribute to the response.
+    """
+
+    __slots__ = ("_value",)
+
+    def __init__(self, value: SimpleNamespace) -> None:
+        self._value = value
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self._resolve(), name)
+        return getattr(self._value, name)
 
     def __await__(self):
-        return asyncio.to_thread(self._resolve).__await__()
+        async def _self() -> "_ResponseHandle":
+            return self
+
+        return _self().__await__()
 
 
 class _LazyStream:
@@ -1184,7 +1185,13 @@ class OpenCodeClient:
             )
 
         if not stream:
-            return _LazyValue(factory)
+            # Resolve the response here, never lazily. Hermes samples this call's latency
+            # BEFORE it reads the body: agent/turn_response_check.py:119 computes
+            # ``api_duration`` ahead of the transport normalization that first touches
+            # ``response.choices``. A lazily-resolved response therefore reports ~0 s and
+            # every derived figure (t/s, average latency) is dropped. A plain OpenAI
+            # client blocks inside create(); match that.
+            return _ResponseHandle(factory())
 
         def stream_factory() -> Iterator[SimpleNamespace]:
             events, mapped_tools = self._direct_events(
