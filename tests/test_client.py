@@ -7,6 +7,7 @@ import io
 import json
 import sys
 import tempfile
+import time
 import unittest
 import urllib.error
 from pathlib import Path
@@ -58,6 +59,32 @@ def tool(name):
 class ClientTests(unittest.TestCase):
     def test_session_id_matches_opencode_shape(self):
         self.assertRegex(client._session_id(), r"^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$")
+
+    def test_session_id_encodes_a_descending_timestamp(self):
+        """The relay rejects a ses_ id whose head is not ~(ms * 4096 + counter)."""
+        session = client._session_id()
+        stamp = (~int(session[4:16], 16) & ((1 << 48) - 1)) >> 12
+        # The 48-bit head keeps only the low 36 bits of the millisecond clock.
+        window = 1 << 36
+        delta = (stamp - int(time.time() * 1000)) % window
+        self.assertLess(min(delta, window - delta), 2000)
+
+    def test_wire_endpoints_use_the_inference_base(self):
+        for url in (client.DIRECT_URL, client.RESPONSES_URL, client.MODELS_URL):
+            self.assertTrue(url.startswith("https://opencode.ai/inference/v1/"), url)
+
+    def test_compat_markers_keep_the_opencode_parameter_schema(self):
+        """An empty parameter object on a marker fails the relay's tool gate."""
+        wire, mapped = client._wire_tools([])
+        self.assertEqual(mapped, {})
+        self.assertEqual(
+            [entry["function"]["name"] for entry in wire],
+            list(client.COMPAT_TOOL_NAMES),
+        )
+        for entry in wire:
+            name = entry["function"]["name"]
+            self.assertEqual(entry["function"]["parameters"], client.COMPAT_TOOL_PARAMETERS[name])
+            self.assertTrue(entry["function"]["parameters"].get("properties"))
 
     def test_direct_request_preserves_hermes_tools_and_returns_native_call(self):
         captured = {}
@@ -795,7 +822,7 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual(json.loads(cache.read_text()), ["free-a", "free-b"])
         self.assertEqual(
             [call.args[0].full_url for call in opened.call_args_list],
-            [client.ZEN_MODELS_URL, client.MODELS_DEV_URL],
+            [client.MODELS_URL, client.MODELS_DEV_URL],
         )
         self.assertTrue(
             all(

@@ -21,12 +21,14 @@ from typing import Any
 
 from hermes_constants import get_hermes_home  # type: ignore[import-not-found]
 
-DIRECT_URL = "https://opencode.ai/zen/v1/chat/completions"
-RESPONSES_URL = "https://opencode.ai/zen/v1/responses"
-ZEN_MODELS_URL = "https://opencode.ai/zen/v1/models"
+DIRECT_URL = "https://opencode.ai/inference/v1/chat/completions"
+RESPONSES_URL = "https://opencode.ai/inference/v1/responses"
+MODELS_URL = "https://opencode.ai/inference/v1/models"
 MODELS_DEV_URL = "https://models.dev/api.json"
 LOGICAL_BASE_URL = DIRECT_URL
-OPENCODE_VERSION = "1.18.31"
+OPENCODE_VERSION = "2.0.5"
+# The relay accepts only a bare "opencode/<semver>" User-Agent. The official
+# client's own "opencode/latest/<ver>/cli" form is rejected with FreeTierError.
 OPENCODE_USER_AGENT = f"opencode/{OPENCODE_VERSION}"
 DEFAULT_MODEL = "big-pickle"
 FALLBACK_MODELS = (
@@ -312,7 +314,7 @@ def _models_for_process(timeout: float) -> tuple[str, ...]:
         if _MODEL_SNAPSHOT is None:
             try:
                 models = _free_live_models(
-                    _json_get(ZEN_MODELS_URL, timeout),
+                    _json_get(MODELS_URL, timeout),
                     _json_get(MODELS_DEV_URL, timeout),
                 )
             except (OSError, ValueError, urllib.error.URLError):
@@ -326,28 +328,37 @@ def _models_for_process(timeout: float) -> tuple[str, ...]:
 
 
 def _session_id() -> str:
+    """OpenCode session id: ``ses_`` + 6 inverted-timestamp bytes + 14 base62 chars.
+
+    The official client encodes ``~(ms * 4096 + counter)`` in the low 48 bits, so
+    ids sort newest-first; the relay rejects any id that is not encoded this way.
+    """
     global _SESSION_COUNTER
     with _SESSION_LOCK:
         _SESSION_COUNTER = (_SESSION_COUNTER + 1) & 0xFFF
-        prefix = ((int(time.time() * 1000) << 12) | _SESSION_COUNTER) & ((1 << 48) - 1)
+        counter = _SESSION_COUNTER
+        stamp = int(time.time() * 1000)
+    value = ~((stamp << 12) + counter) & ((1 << 48) - 1)
     return (
         "ses_"
-        + prefix.to_bytes(6, "big").hex()
+        + value.to_bytes(6, "big").hex()
         + "".join(secrets.choice(_BASE62) for _ in range(14))
     )
 
 
 def _compat_tool(name: str) -> dict[str, Any]:
+    """OpenCode-named alias for a Hermes tool this session did not supply.
+
+    The relay fingerprints the advertised tool schemas and rejects a ``read``
+    with an empty parameter object, so the marker keeps OpenCode's real schema
+    even though the tool cannot be dispatched; the description says so.
+    """
     return {
         "type": "function",
         "function": {
             "name": name,
             "description": "Compatibility marker; unavailable. Never call.",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "additionalProperties": False,
-            },
+            "parameters": COMPAT_TOOL_PARAMETERS[name],
         },
     }
 
