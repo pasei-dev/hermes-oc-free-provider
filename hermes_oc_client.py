@@ -1358,6 +1358,9 @@ class OpenCodeClient:
             "stop": stop,
             "parallel_tool_calls": extra.get("parallel_tool_calls"),
             "response_format": extra.get("response_format"),
+            # The provider profile puts the reasoning dial here (top level, never extra_body.reasoning,
+            # whose emission a host allowlist gates). The relay honours ``none`` as thinking-off.
+            "reasoning_effort": extra.get("reasoning_effort"),
         }
         body.update(
             {key: value for key, value in optional.items() if value is not None}
