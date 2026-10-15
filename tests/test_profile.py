@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -75,6 +78,114 @@ class ReasoningWiringTests(unittest.TestCase):
             with self.subTest(model=model):
                 self.assertTrue(caps.get("supports_tools"))
                 self.assertTrue(caps.get("supports_reasoning"))
+
+
+class CatalogLimitTests(unittest.TestCase):
+    """What the context meter, the output cap and the cost line read for a free model."""
+
+    def setUp(self):
+        import hermes_oc_client as client
+
+        self.client = client
+        self._saved = dict(client._CATALOG_LIMITS)
+        client._CATALOG_LIMITS.clear()
+        client._CATALOG_LIMITS.update(
+            {
+                "deepseek-v4.1-flash-free": {"context": 200000, "output": 32000},
+                "muse-spark-1.3-contributor-free": {"context": 1048576, "output": 131072},
+            }
+        )
+
+    def tearDown(self):
+        self.client._CATALOG_LIMITS.clear()
+        self.client._CATALOG_LIMITS.update(self._saved)
+
+    def test_the_paid_siblings_window_never_leaks_in(self):
+        # Hermes' family fallback reads the paid `deepseek-v4.1-flash` row (1000000) for this id.
+        self.assertEqual(
+            plugin.opencode_free.get_model_context_length("deepseek-v4.1-flash-free"), 200000
+        )
+        self.assertEqual(
+            plugin.opencode_free.get_model_context_length("muse-spark-1.3-contributor-free"),
+            1048576,
+        )
+        self.assertIsNone(plugin.opencode_free.get_model_context_length("not-in-the-catalog"))
+
+    def test_the_output_cap_comes_from_the_catalog(self):
+        self.assertEqual(
+            plugin.opencode_free.get_max_tokens("deepseek-v4.1-flash-free"), 32000
+        )
+        self.assertIsNone(plugin.opencode_free.get_max_tokens("not-in-the-catalog"))
+
+    def test_free_usage_prices_as_included(self):
+        """The host's CostResult is imported lazily, so stand one in: the shape is the contract."""
+        from dataclasses import dataclass
+
+        @dataclass(frozen=True)
+        class CostResult:
+            amount_usd: object
+            status: str
+            source: str
+            label: str
+
+        host = types.ModuleType("agent")
+        host.__path__ = []  # a package stub, so the lazy `from agent.usage_pricing import …` lands
+        pricing = types.ModuleType("agent.usage_pricing")
+        setattr(pricing, "CostResult", CostResult)
+        with mock.patch.dict(sys.modules, {"agent": host, "agent.usage_pricing": pricing}):
+            cost = plugin.opencode_free.get_usage_cost("deepseek-v4.1-flash-free", None)
+        self.assertEqual((cost.status, cost.label, str(cost.amount_usd)), ("included", "included", "0"))
+
+    def test_cost_degrades_when_the_host_cannot_answer(self):
+        """No host module (an older Hermes) must leave pricing to Hermes rather than raise."""
+        with mock.patch.dict(sys.modules, {"agent.usage_pricing": None}):
+            self.assertIsNone(
+                plugin.opencode_free.get_usage_cost("deepseek-v4.1-flash-free", None)
+            )
+
+    def test_limits_extraction_keeps_only_real_numbers(self):
+        catalog = {
+            "opencode": {
+                "models": {
+                    "free-a": {"limit": {"context": 1000, "output": 100}},
+                    "free-b": {"limit": {"context": 0, "output": True}},
+                    "free-c": {"limit": "nonsense"},
+                    "free-d": {},
+                }
+            }
+        }
+        self.assertEqual(
+            self.client._free_live_limits(["free-a", "free-b", "free-c", "free-d", "absent"], catalog),
+            {"free-a": {"context": 1000, "output": 100}},
+        )
+        self.assertEqual(self.client._free_live_limits(["free-a"], {"deepinfra": {}}), {})
+
+
+class ModelCacheTests(unittest.TestCase):
+    """The discovery cache carries the limits too, and still reads the older ids-only file."""
+
+    def setUp(self):
+        import hermes_oc_client as client
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.client = client
+        patcher = mock.patch.object(
+            client, "_model_cache_path", return_value=Path(self.tmp.name) / "models.json"
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_limits_round_trip_through_the_cache(self):
+        self.client._save_model_cache(["a-free"], {"a-free": {"context": 4096, "output": 512}})
+        self.assertEqual(
+            self.client._load_model_cache(),
+            (["a-free"], {"a-free": {"context": 4096, "output": 512}}),
+        )
+
+    def test_a_legacy_ids_only_file_still_reads(self):
+        Path(self.tmp.name, "models.json").write_text('["a-free", "a-free", "b-free"]')
+        self.assertEqual(self.client._load_model_cache(), (["a-free", "b-free"], {}))
 
 
 if __name__ == "__main__":

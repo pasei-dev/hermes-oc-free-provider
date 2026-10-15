@@ -899,7 +899,11 @@ class ClientTests(unittest.TestCase):
                 oc = client.OpenCodeClient()
                 self.assertEqual(oc.list_models(), ["free-a", "free-b"])
                 self.assertEqual(oc.list_models(), ["free-a", "free-b"])
-                self.assertEqual(json.loads(cache.read_text()), ["free-a", "free-b"])
+                # The snapshot carries the catalog limits beside the ids; a legacy ids-only file
+                # still reads (see test_profile.ModelCacheTests).
+                self.assertEqual(
+                    json.loads(cache.read_text()), {"models": ["free-a", "free-b"], "limits": {}}
+                )
         self.assertEqual(
             [call.args[0].full_url for call in opened.call_args_list],
             [client.MODELS_URL, client.MODELS_DEV_URL],

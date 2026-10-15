@@ -17,6 +17,7 @@ from hermes_oc_client import (  # type: ignore[import-not-found]
     FALLBACK_MODELS,
     LOGICAL_BASE_URL,
     OpenCodeClient,
+    catalog_limit,
 )
 from providers import register_provider  # type: ignore[import-not-found]
 from providers.base import ProviderProfile  # type: ignore[import-not-found]
@@ -68,6 +69,32 @@ class OpenCodeFreeProfile(ProviderProfile):
             return {}, {"reasoning_effort": "none"}
         # Never escalate: an unknown or Hermes-internal level (``ultra``) becomes the default.
         return {}, {"reasoning_effort": effort if effort in _REASONING_EFFORTS else "medium"}
+
+    def get_model_context_length(self, model: str | None) -> int | None:
+        """The free model's own catalog window.
+
+        Hermes cannot resolve this provider name against the catalog, and its family fallback is
+        wrong for these ids — it reads the paid sibling's window (1M for `deepseek-v4.1-flash-free`,
+        256K default for `big-pickle`). This hook is checked before those guesses, so the meter and
+        the compressor agree with what the official OpenCode routes show.
+        """
+        return catalog_limit(model, "context")
+
+    def get_max_tokens(self, model: str | None) -> int | None:
+        """The catalog's output cap for the model; the relay serves no limit metadata of its own."""
+        return catalog_limit(model, "output") or self.default_max_tokens
+
+    def get_usage_cost(self, model: str, usage: Any) -> Any | None:
+        """The free tier bills nothing: report the route as included instead of unknown."""
+        try:
+            from agent.usage_pricing import CostResult
+        except ImportError:  # Older host: leave pricing to Hermes' own fallbacks.
+            return None
+        from decimal import Decimal
+
+        return CostResult(
+            amount_usd=Decimal(0), status="included", source="none", label="included"
+        )
 
     def fetch_models(
         self,
