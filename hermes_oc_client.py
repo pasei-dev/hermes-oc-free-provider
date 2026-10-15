@@ -7,6 +7,7 @@ agent loop and every tool execution in Hermes.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import secrets
 import string
@@ -257,9 +258,16 @@ def _inference_request(url: str, body: dict[str, Any], session: str) -> urllib.r
 
 
 def _sse_events(
-    request: urllib.request.Request, timeout: float
+    request: urllib.request.Request,
+    timeout: float,
+    *,
+    owner: "OpenCodeClient | None" = None,
 ) -> Iterator[dict[str, Any]]:
-    """Open *request* and yield its ``data:`` payloads until ``[DONE]``."""
+    """Open *request* and yield its ``data:`` payloads until ``[DONE]``.
+
+    With *owner*, the live response is registered with that client so its ``close()`` can abort this
+    read from another thread — which is how an interrupt or a restart releases the request.
+    """
     try:
         response = _urlopen(request, timeout)
     except urllib.error.HTTPError as exc:
@@ -267,16 +275,26 @@ def _sse_events(
         raise _status_error(exc.code, body_text, INFERENCE_CONTEXT) from exc
     except urllib.error.URLError as exc:
         raise OpenCodeError(f"{INFERENCE_CONTEXT} failed: {exc.reason}") from exc
-    with response:
-        for raw_line in response:
-            line = raw_line.decode("utf-8", "replace").strip()
-            if not line.startswith("data:"):
-                continue
-            payload = line[5:].strip()
-            if payload == "[DONE]":
-                return
-            if payload:
-                yield json.loads(payload)
+    tracked = owner._track_inflight(response) if owner is not None else contextlib.nullcontext()
+    with response, tracked:
+        try:
+            for raw_line in response:
+                if owner is not None and owner.is_closed:
+                    raise OpenCodeError("OpenCode client was closed mid-request.")
+                line = raw_line.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    return
+                if payload:
+                    yield json.loads(payload)
+        except (OSError, ValueError) as exc:
+            # ``close()`` aborts a blocked read from a stranger thread, so the reader sees a closed
+            # file: that is an abort, not a provider failure.
+            if owner is not None and owner.is_closed:
+                raise OpenCodeError("OpenCode client was closed mid-request.") from exc
+            raise
 
 
 def _json_get(url: str, timeout: float) -> Any:
@@ -1106,26 +1124,27 @@ def _next_or_done(iterator: Iterator[Any]) -> tuple[bool, Any]:
         return False, None
 
 
-class _LazyValue:
-    def __init__(self, factory):
-        self._factory = factory
-        self._value = None
-        self._ready = False
-        self._lock = threading.Lock()
+class _ResponseHandle:
+    """An already-fetched response that the async contract can still await.
 
-    def _resolve(self):
-        if not self._ready:
-            with self._lock:
-                if not self._ready:
-                    self._value = self._factory()
-                    self._ready = True
-        return self._value
+    ``create()`` performs the request eagerly and hands back the parsed response
+    wrapped here; the wrapper exists only so ``await client.chat.completions.create(...)``
+    works (the async client contract), and delegates every attribute to the response.
+    """
+
+    __slots__ = ("_value",)
+
+    def __init__(self, value: SimpleNamespace) -> None:
+        self._value = value
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self._resolve(), name)
+        return getattr(self._value, name)
 
     def __await__(self):
-        return asyncio.to_thread(self._resolve).__await__()
+        async def _self() -> "_ResponseHandle":
+            return self
+
+        return _self().__await__()
 
 
 class _LazyStream:
@@ -1181,9 +1200,37 @@ class OpenCodeClient:
         )
         self.is_closed = False
         self._session = _session_id()
+        self._inflight: set[Any] = set()
+        self._inflight_lock = threading.Lock()
 
     def close(self) -> None:
+        """Close the client AND abort whatever request it has in flight.
+
+        Hermes' interrupt and stale watchdogs close the request client from a stranger thread and
+        expect the socket to die (`agent/client_lifecycle.py`); a flag alone leaves the worker
+        blocked in the read until the HTTP timeout expires, so the turn keeps looking active — and
+        a gateway restart keeps waiting on it. Closing the live response breaks that read.
+        """
         self.is_closed = True
+        with self._inflight_lock:
+            live = list(self._inflight)
+            self._inflight.clear()
+        for response in live:
+            try:
+                response.close()
+            except Exception:  # noqa: BLE001 -- an abort must never raise into the closer.
+                pass
+
+    @contextlib.contextmanager
+    def _track_inflight(self, response: Any) -> Iterator[Any]:
+        """Register a live HTTP response for the life of its read (see ``close``)."""
+        with self._inflight_lock:
+            self._inflight.add(response)
+        try:
+            yield response
+        finally:
+            with self._inflight_lock:
+                self._inflight.discard(response)
 
     def list_models(self, *, timeout: float = 15.0) -> list[str]:
         return list(_models_for_process(timeout))
@@ -1226,7 +1273,13 @@ class OpenCodeClient:
             )
 
         if not stream:
-            return _LazyValue(factory)
+            # Resolve the response here, never lazily. Hermes samples this call's latency
+            # BEFORE it reads the body: agent/turn_response_check.py:119 computes
+            # ``api_duration`` ahead of the transport normalization that first touches
+            # ``response.choices``. A lazily-resolved response therefore reports ~0 s and
+            # every derived figure (t/s, average latency) is dropped. A plain OpenAI
+            # client blocks inside create(); match that.
+            return _ResponseHandle(factory())
 
         def stream_factory() -> Iterator[SimpleNamespace]:
             events, mapped_tools = self._direct_events(
@@ -1319,7 +1372,7 @@ class OpenCodeClient:
                 }
             )
         request = _inference_request(DIRECT_URL, body, self._session)
-        return _sse_events(request, timeout), mapped_tools
+        return _sse_events(request, timeout, owner=self), mapped_tools
 
     def _responses_events(
         self,
@@ -1382,7 +1435,7 @@ class OpenCodeClient:
             saw_tool_call = False
             call_indexes: dict[int, int] = {}
             selected_model = model
-            for event in _sse_events(request, timeout):
+            for event in _sse_events(request, timeout, owner=self):
                 seen = True
                 kind = str(event.get("type") or "")
                 response = event.get("response") or {}
