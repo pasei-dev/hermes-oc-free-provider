@@ -3,3 +3,5 @@ __pycache__/
 .pytest_cache/
 .coverage
 .DS_Store
+# written by `hermes plugins install`, never by hand
+.hermes-catalog.json
