@@ -237,6 +237,48 @@ def _urlopen(request: urllib.request.Request, timeout: float):
     return _OPENER.open(request, timeout=timeout)
 
 
+INFERENCE_CONTEXT = "OpenCode free-model inference"
+
+
+def _inference_request(url: str, body: dict[str, Any], session: str) -> urllib.request.Request:
+    """The envelope every free-tier call carries."""
+    return urllib.request.Request(
+        url,
+        data=json.dumps(body, separators=(",", ":")).encode(),
+        method="POST",
+        headers={
+            "Authorization": "Bearer public",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+            "User-Agent": OPENCODE_USER_AGENT,
+            "x-opencode-session": session,
+        },
+    )
+
+
+def _sse_events(
+    request: urllib.request.Request, timeout: float
+) -> Iterator[dict[str, Any]]:
+    """Open *request* and yield its ``data:`` payloads until ``[DONE]``."""
+    try:
+        response = _urlopen(request, timeout)
+    except urllib.error.HTTPError as exc:
+        body_text = exc.read().decode("utf-8", "replace")
+        raise _status_error(exc.code, body_text, INFERENCE_CONTEXT) from exc
+    except urllib.error.URLError as exc:
+        raise OpenCodeError(f"{INFERENCE_CONTEXT} failed: {exc.reason}") from exc
+    with response:
+        for raw_line in response:
+            line = raw_line.decode("utf-8", "replace").strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if payload == "[DONE]":
+                return
+            if payload:
+                yield json.loads(payload)
+
+
 def _json_get(url: str, timeout: float) -> Any:
     request = urllib.request.Request(
         url,
@@ -1276,44 +1318,8 @@ class OpenCodeClient:
                     not in {"model", "messages", "tools", "stream", "stream_options"}
                 }
             )
-        data = json.dumps(body, separators=(",", ":")).encode()
-        request = urllib.request.Request(
-            DIRECT_URL,
-            data=data,
-            method="POST",
-            headers={
-                "Authorization": "Bearer public",
-                "Content-Type": "application/json",
-                "Accept": "text/event-stream",
-                "User-Agent": OPENCODE_USER_AGENT,
-                "x-opencode-session": self._session,
-            },
-        )
-
-        def events() -> Iterator[dict[str, Any]]:
-            try:
-                response = _urlopen(request, timeout)
-            except urllib.error.HTTPError as exc:
-                body_text = exc.read().decode("utf-8", "replace")
-                raise _status_error(
-                    exc.code, body_text, "OpenCode free-model inference"
-                ) from exc
-            except urllib.error.URLError as exc:
-                raise OpenCodeError(
-                    f"OpenCode free-model inference failed: {exc.reason}"
-                ) from exc
-            with response:
-                for raw_line in response:
-                    line = raw_line.decode("utf-8", "replace").strip()
-                    if not line.startswith("data:"):
-                        continue
-                    payload = line[5:].strip()
-                    if payload == "[DONE]":
-                        return
-                    if payload:
-                        yield json.loads(payload)
-
-        return events(), mapped_tools
+        request = _inference_request(DIRECT_URL, body, self._session)
+        return _sse_events(request, timeout), mapped_tools
 
     def _responses_events(
         self,
@@ -1369,48 +1375,14 @@ class OpenCodeClient:
                     }
                 }
             )
-        request = urllib.request.Request(
-            RESPONSES_URL,
-            data=json.dumps(body, separators=(",", ":")).encode(),
-            method="POST",
-            headers={
-                "Authorization": "Bearer public",
-                "Content-Type": "application/json",
-                "Accept": "text/event-stream",
-                "User-Agent": OPENCODE_USER_AGENT,
-                "x-opencode-session": self._session,
-            },
-        )
-
-        def source() -> Iterator[dict[str, Any]]:
-            try:
-                response = _urlopen(request, timeout)
-            except urllib.error.HTTPError as exc:
-                body_text = exc.read().decode("utf-8", "replace")
-                raise _status_error(
-                    exc.code, body_text, "OpenCode free-model inference"
-                ) from exc
-            except urllib.error.URLError as exc:
-                raise OpenCodeError(
-                    f"OpenCode free-model inference failed: {exc.reason}"
-                ) from exc
-            with response:
-                for raw_line in response:
-                    line = raw_line.decode("utf-8", "replace").strip()
-                    if not line.startswith("data:"):
-                        continue
-                    payload = line[5:].strip()
-                    if payload == "[DONE]":
-                        return
-                    if payload:
-                        yield json.loads(payload)
+        request = _inference_request(RESPONSES_URL, body, self._session)
 
         def events() -> Iterator[dict[str, Any]]:
             seen = False
             saw_tool_call = False
             call_indexes: dict[int, int] = {}
             selected_model = model
-            for event in source():
+            for event in _sse_events(request, timeout):
                 seen = True
                 kind = str(event.get("type") or "")
                 response = event.get("response") or {}
