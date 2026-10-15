@@ -7,6 +7,7 @@ agent loop and every tool execution in Hermes.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import secrets
 import string
@@ -1140,9 +1141,37 @@ class OpenCodeClient:
         )
         self.is_closed = False
         self._session = _session_id()
+        self._inflight: set[Any] = set()
+        self._inflight_lock = threading.Lock()
 
     def close(self) -> None:
+        """Close the client AND abort whatever request it has in flight.
+
+        Hermes' interrupt and stale watchdogs close the request client from a stranger thread and
+        expect the socket to die (`agent/client_lifecycle.py`); a flag alone leaves the worker
+        blocked in the read until the HTTP timeout expires, so the turn keeps looking active — and
+        a gateway restart keeps waiting on it. Closing the live response breaks that read.
+        """
         self.is_closed = True
+        with self._inflight_lock:
+            live = list(self._inflight)
+            self._inflight.clear()
+        for response in live:
+            try:
+                response.close()
+            except Exception:  # noqa: BLE001 -- an abort must never raise into the closer.
+                pass
+
+    @contextlib.contextmanager
+    def _track_inflight(self, response: Any) -> Iterator[Any]:
+        """Register a live HTTP response for the life of its read (see ``close``)."""
+        with self._inflight_lock:
+            self._inflight.add(response)
+        try:
+            yield response
+        finally:
+            with self._inflight_lock:
+                self._inflight.discard(response)
 
     def list_models(self, *, timeout: float = 15.0) -> list[str]:
         return list(_models_for_process(timeout))
@@ -1309,16 +1338,25 @@ class OpenCodeClient:
                 raise OpenCodeError(
                     f"OpenCode free-model inference failed: {exc.reason}"
                 ) from exc
-            with response:
-                for raw_line in response:
-                    line = raw_line.decode("utf-8", "replace").strip()
-                    if not line.startswith("data:"):
-                        continue
-                    payload = line[5:].strip()
-                    if payload == "[DONE]":
-                        return
-                    if payload:
-                        yield json.loads(payload)
+            with response, self._track_inflight(response):
+                try:
+                    for raw_line in response:
+                        if self.is_closed:
+                            raise OpenCodeError("OpenCode client was closed mid-request.")
+                        line = raw_line.decode("utf-8", "replace").strip()
+                        if not line.startswith("data:"):
+                            continue
+                        payload = line[5:].strip()
+                        if payload == "[DONE]":
+                            return
+                        if payload:
+                            yield json.loads(payload)
+                except (OSError, ValueError) as exc:
+                    # ``close()`` aborts a blocked read from a stranger thread, so the reader sees a
+                    # closed file: that is an abort, not a provider failure.
+                    if self.is_closed:
+                        raise OpenCodeError("OpenCode client was closed mid-request.") from exc
+                    raise
 
         return events(), mapped_tools
 
@@ -1401,16 +1439,25 @@ class OpenCodeClient:
                 raise OpenCodeError(
                     f"OpenCode free-model inference failed: {exc.reason}"
                 ) from exc
-            with response:
-                for raw_line in response:
-                    line = raw_line.decode("utf-8", "replace").strip()
-                    if not line.startswith("data:"):
-                        continue
-                    payload = line[5:].strip()
-                    if payload == "[DONE]":
-                        return
-                    if payload:
-                        yield json.loads(payload)
+            with response, self._track_inflight(response):
+                try:
+                    for raw_line in response:
+                        if self.is_closed:
+                            raise OpenCodeError("OpenCode client was closed mid-request.")
+                        line = raw_line.decode("utf-8", "replace").strip()
+                        if not line.startswith("data:"):
+                            continue
+                        payload = line[5:].strip()
+                        if payload == "[DONE]":
+                            return
+                        if payload:
+                            yield json.loads(payload)
+                except (OSError, ValueError) as exc:
+                    # ``close()`` aborts a blocked read from a stranger thread, so the reader sees a
+                    # closed file: that is an abort, not a provider failure.
+                    if self.is_closed:
+                        raise OpenCodeError("OpenCode client was closed mid-request.") from exc
+                    raise
 
         def events() -> Iterator[dict[str, Any]]:
             seen = False

@@ -7,6 +7,7 @@ import io
 import json
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
@@ -784,6 +785,57 @@ class ClientTests(unittest.TestCase):
             with self.assertRaisesRegex(client.OpenCodeError, "client is closed"):
                 oc.chat.completions.create(model="m", messages=[])
         open_request.assert_not_called()
+
+    def test_close_aborts_an_in_flight_read(self):
+        """``close()`` must break a blocked read, not just set a flag.
+
+        Hermes' interrupt and stale watchdogs close the request client from a stranger thread and
+        rely on the socket dying; a flag leaves the worker parked until the HTTP timeout, which is
+        what keeps a turn (and a gateway drain) looking active.
+        """
+        release = threading.Event()
+        reading = threading.Event()
+
+        class BlockingRead:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def close(self):
+                release.set()
+
+            def __iter__(self):
+                reading.set()
+                while not release.wait(0.01):
+                    pass
+                raise ValueError("I/O operation on closed file")
+
+        oc = client.OpenCodeClient()
+        outcome: dict = {}
+
+        def run():
+            try:
+                oc.chat.completions.create(model="m", messages=[])
+            except Exception as exc:  # noqa: BLE001 -- asserted below.
+                outcome["error"] = exc
+            else:
+                outcome["error"] = None
+
+        with mock.patch.object(client, "_urlopen", return_value=BlockingRead()):
+            worker = threading.Thread(target=run)
+            worker.start()
+            self.assertTrue(reading.wait(5), "the request never started reading")
+            started = time.monotonic()
+            oc.close()
+            worker.join(5)
+            elapsed = time.monotonic() - started
+
+        self.assertFalse(worker.is_alive(), "close() left the read blocked")
+        self.assertLess(elapsed, 2.0, "close() was not what released the read")
+        self.assertIsInstance(outcome.get("error"), client.OpenCodeError)
+        self.assertIn("closed mid-request", str(outcome["error"]))
 
     def test_catalog_intersects_live_zero_cost_tool_models(self):
         zen = {"data": [{"id": model} for model in ("free-a", "free-b", "paid")]}
