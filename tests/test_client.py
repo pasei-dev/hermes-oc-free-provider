@@ -786,6 +786,37 @@ class ClientTests(unittest.TestCase):
                 oc.chat.completions.create(model="m", messages=[])
         open_request.assert_not_called()
 
+    def test_reasoning_effort_reaches_the_wire_only_when_the_profile_sends_it(self):
+        """The profile hands the dial down as a top-level kwarg; the encoder must put it on the wire,
+        and leave it off when the profile withholds it (the responses route 400s on it)."""
+        captured = {}
+
+        def fake_open(request, timeout):
+            captured["request"] = request
+            return sse(
+                {
+                    "model": "m",
+                    "choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}],
+                }
+            )
+
+        oc = client.OpenCodeClient()
+        with mock.patch.object(client, "_urlopen", side_effect=fake_open):
+            oc.chat.completions.create(
+                model="deepseek-v4.1-flash-free",
+                messages=[{"role": "user", "content": "hi"}],
+                reasoning_effort="high",
+            )
+            asked = json.loads(captured["request"].data)
+            self.assertEqual(asked.get("reasoning_effort"), "high")
+
+            oc.chat.completions.create(
+                model="deepseek-v4.1-flash-free",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+            unasked = json.loads(captured["request"].data)
+        self.assertNotIn("reasoning_effort", unasked)
+
     def test_close_aborts_an_in_flight_read(self):
         """``close()`` must break a blocked read, not just set a flag.
 
