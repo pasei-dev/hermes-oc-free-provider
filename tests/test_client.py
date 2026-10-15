@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -87,6 +88,39 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(entry["function"]["parameters"], client.COMPAT_TOOL_PARAMETERS[name])
             self.assertTrue(entry["function"]["parameters"].get("properties"))
 
+    def test_envelope_capture_records_what_the_single_build_site_sends(self):
+        """$HERMES_OC_DEBUG captures the wire envelope; unset it writes nothing and never raises."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "envelope.jsonl"
+            with mock.patch.dict("os.environ", {client.ENVELOPE_CAPTURE_ENV: str(path)}):
+                request = client._inference_request(
+                    client.DIRECT_URL, {"model": "cat-jam-free", "tools": []}, "ses_abc"
+                )
+            lines = path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(lines), 1)
+            captured = json.loads(lines[0])
+            self.assertEqual(captured["url"], client.DIRECT_URL)
+            self.assertEqual(captured["headers"]["Authorization"], "Bearer public")
+            self.assertEqual(captured["headers"]["User-agent"], client.OPENCODE_USER_AGENT)
+            self.assertEqual(captured["headers"]["X-opencode-session"], "ses_abc")
+            # The body is the exact encoded request body, not a re-serialization of it.
+            self.assertEqual(
+                json.dumps(json.loads(captured["body"]), separators=(",", ":")),
+                bytes(request.data or b"").decode(),
+            )
+
+    def test_envelope_capture_is_silent_and_safe_when_disabled_or_unwritable(self):
+        with mock.patch.dict("os.environ", {}, clear=False):
+            os.environ.pop(client.ENVELOPE_CAPTURE_ENV, None)
+            request = client._inference_request(client.DIRECT_URL, {"model": "m"}, "ses_abc")
+            self.assertTrue(request.data)
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "not-a-file"
+            directory.mkdir()
+            with mock.patch.dict("os.environ", {client.ENVELOPE_CAPTURE_ENV: str(directory)}):
+                request = client._inference_request(client.DIRECT_URL, {"model": "m"}, "ses_abc")
+            self.assertEqual(request.get_header("User-agent"), client.OPENCODE_USER_AGENT)
+
     def test_direct_request_preserves_hermes_tools_and_returns_native_call(self):
         captured = {}
 
@@ -163,6 +197,63 @@ class ClientTests(unittest.TestCase):
         self.assertTrue(
             captured["request"].headers["X-opencode-session"].startswith("ses_")
         )
+
+    def test_unsupported_reasoning_dials_never_reach_the_wire(self):
+        """The relay takes only its own five effort values; Hermes' thinking-off dial is refused.
+
+        Verified live: forwarding ``none`` (or ``minimal``) returns HTTP 400
+        ``[unsupported_value] ... only supports 'max', 'xhigh', 'high', 'medium' or 'low'``, so the
+        field is dropped for those and the model keeps its own default.
+        """
+        captured = {}
+
+        def fake_open(request, timeout):
+            captured["request"] = request
+            return sse(
+                {"model": "m", "choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}
+            )
+
+        for dial, expected in (
+            ("none", None),
+            ("minimal", None),
+            ("low", "low"),
+            ("high", "high"),
+            ("xhigh", "xhigh"),
+        ):
+            with self.subTest(dial=dial), mock.patch.object(
+                client, "_urlopen", side_effect=fake_open
+            ):
+                oc = client.OpenCodeClient()
+                oc.chat.completions.create(
+                    model="m",
+                    messages=[{"role": "user", "content": "probe"}],
+                    tools=[],
+                    reasoning_effort=dial,
+                )
+            body = json.loads(captured["request"].data)
+            self.assertEqual(body.get("reasoning_effort"), expected)
+
+    def test_usage_carries_the_reasoning_token_detail_hermes_reads(self):
+        """Hermes reads thinking tokens from ``completion_tokens_details`` (usage_pricing.py:654).
+
+        The relay sends that object on the final chunk; without it every free-model turn is
+        recorded as having thought zero tokens.
+        """
+        usage = client._usage(
+            {
+                "prompt_tokens": 929,
+                "completion_tokens": 51,
+                "total_tokens": 980,
+                "prompt_tokens_details": {"cached_tokens": 896},
+                "completion_tokens_details": {"reasoning_tokens": 40},
+            }
+        )
+        self.assertEqual(usage.completion_tokens_details.reasoning_tokens, 40)
+        self.assertEqual(usage.prompt_tokens_details.cached_tokens, 896)
+        self.assertEqual(usage.total_tokens, 980)
+        # A payload without the detail reports zero rather than raising.
+        self.assertEqual(client._usage({}).completion_tokens_details.reasoning_tokens, 0)
+        self.assertEqual(client._usage().completion_tokens_details.reasoning_tokens, 0)
 
     def test_repeated_tool_identity_and_reasoning_details_are_preserved(self):
         oc = client.OpenCodeClient()

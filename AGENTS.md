@@ -43,7 +43,10 @@ Hermes' own data-training acknowledgement first.
 
 **A code change is not live until the backend restarts.** A gateway imports this plugin once, at process
 start, and re-imports nothing afterwards — not even when an install reports reloading it. A stale process
-looks exactly like a broken fix: the old failure survives code that is correct on disk.
+looks exactly like a broken fix: the old failure survives code that is correct on disk. One gateway per
+host serves every profile, and `hermes -z` is a *client* of it (`hermes_cli/gateway_chat.py`): the
+acceptance check below therefore runs the gateway's in-memory module, never the file you just edited, so
+restart the host gateway before concluding anything from it.
 
 ## Git
 

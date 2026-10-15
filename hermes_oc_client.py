@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import secrets
 import string
 import threading
@@ -242,10 +243,37 @@ def _urlopen(request: urllib.request.Request, timeout: float):
 
 INFERENCE_CONTEXT = "OpenCode free-model inference"
 
+#: Environment variable naming a file that every inference envelope is appended to. A relay refusal
+#: (``403 FreeTierError``) is decided by the exact bytes of the envelope, and the request dump Hermes
+#: writes on a failed call records its own ``api_kwargs`` — *before* this client translates them — so
+#: it cannot settle a dispute about the wire. Set this to capture what was actually sent.
+ENVELOPE_CAPTURE_ENV = "HERMES_OC_DEBUG"
+
+
+def _capture_envelope(request: urllib.request.Request) -> None:
+    """Append *request* as one JSON line to ``$HERMES_OC_DEBUG`` when that names a file.
+
+    Called from the single place that builds a request, so the capture and the wire can never drift.
+    Never raises: a diagnostic must not be able to fail an inference call.
+    """
+    path = os.environ.get(ENVELOPE_CAPTURE_ENV)
+    if not path:
+        return
+    try:
+        raw = getattr(request, "data", None)
+        body = bytes(raw).decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else None
+        line = json.dumps(
+            {"url": request.full_url, "headers": dict(request.headers), "body": body}
+        )
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except (OSError, ValueError):
+        pass
+
 
 def _inference_request(url: str, body: dict[str, Any], session: str) -> urllib.request.Request:
     """The envelope every free-tier call carries."""
-    return urllib.request.Request(
+    request = urllib.request.Request(
         url,
         data=json.dumps(body, separators=(",", ":")).encode(),
         method="POST",
@@ -257,6 +285,8 @@ def _inference_request(url: str, body: dict[str, Any], session: str) -> urllib.r
             "x-opencode-session": session,
         },
     )
+    _capture_envelope(request)
+    return request
 
 
 def _sse_events(
@@ -666,6 +696,22 @@ def _effective_timeout(value: Any, default: float = 900.0) -> float:
     )
 
 
+#: The reasoning dial the free models accept, verbatim from the relay's own 400 body.
+_EFFORTS = frozenset({"max", "xhigh", "high", "medium", "low"})
+
+
+def _effort(value: Any) -> str | None:
+    """The relay's own effort vocabulary, or None when the host's dial is not in it.
+
+    Verified against the live relay: ``reasoning_effort`` accepts only max/xhigh/high/medium/low
+    with these models — ``none`` and ``minimal`` come back HTTP 400 ``unsupported_value`` — so an
+    unsupported dial is dropped rather than forwarded, and the model keeps its own default. The
+    free tier has no thinking-off value, so ``none`` still thinks.
+    """
+    effort = str(value or "").strip().lower()
+    return effort if effort in _EFFORTS else None
+
+
 def _namespace(value: Any) -> Any:
     if isinstance(value, dict):
         return SimpleNamespace(**{key: _namespace(item) for key, item in value.items()})
@@ -681,12 +727,23 @@ def _usage(value: Any = None) -> SimpleNamespace:
     total = int(raw.get("total_tokens", prompt + completion) or prompt + completion)
     raw_details = raw.get("prompt_tokens_details")
     details: dict[str, Any] = raw_details if isinstance(raw_details, dict) else {}
+    raw_completion = raw.get("completion_tokens_details")
+    completion_details: dict[str, Any] = (
+        raw_completion if isinstance(raw_completion, dict) else {}
+    )
     return SimpleNamespace(
         prompt_tokens=prompt,
         completion_tokens=completion,
         total_tokens=total,
         prompt_tokens_details=SimpleNamespace(
             cached_tokens=int(details.get("cached_tokens", 0) or 0)
+        ),
+        # Hermes reads a chat-completions provider's thinking tokens out of
+        # ``completion_tokens_details.reasoning_tokens`` (agent/usage_pricing.py:654). The relay
+        # sends them on the final chunk, so omitting the key reports every free-model turn as
+        # having thought zero tokens.
+        completion_tokens_details=SimpleNamespace(
+            reasoning_tokens=int(completion_details.get("reasoning_tokens", 0) or 0)
         ),
     )
 
@@ -1426,8 +1483,10 @@ class OpenCodeClient:
             "parallel_tool_calls": extra.get("parallel_tool_calls"),
             "response_format": extra.get("response_format"),
             # The provider profile puts the reasoning dial here (top level, never extra_body.reasoning,
-            # whose emission a host allowlist gates). The relay honours ``none`` as thinking-off.
-            "reasoning_effort": extra.get("reasoning_effort"),
+            # whose emission a host allowlist gates). The free models take only the relay's own
+            # vocabulary, so a host dial of ``none``/``minimal`` is dropped rather than forwarded —
+            # verified live: anything else is refused with HTTP 400 ``[unsupported_value]``.
+            "reasoning_effort": _effort(extra.get("reasoning_effort")),
         }
         body.update(
             {key: value for key, value in optional.items() if value is not None}
