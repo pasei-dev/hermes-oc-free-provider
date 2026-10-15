@@ -212,6 +212,8 @@ _SESSION_LOCK = threading.Lock()
 _SESSION_COUNTER = 0
 _MODEL_SNAPSHOT: tuple[str, ...] | None = None
 _MODEL_SNAPSHOT_LOCK = threading.Lock()
+#: Per-model ``limit`` metadata for the free models (models.dev rows, keyed by model id).
+_CATALOG_LIMITS: dict[str, dict[str, int]] = {}
 
 
 class OpenCodeError(RuntimeError):
@@ -338,28 +340,73 @@ def _free_live_models(zen: Any, catalog: Any) -> list[str]:
     return sorted(free)
 
 
+def _free_live_limits(models: list[str], catalog: Any) -> dict[str, dict[str, int]]:
+    """The ``limit`` row each free model carries in the models.dev catalog.
+
+    The relay's own ``/models`` lists ids only, so this is where a real context window and output
+    cap come from — the same rows the official OpenCode routes read.
+    """
+    provider = catalog.get("opencode") if isinstance(catalog, dict) else None
+    metadata = provider.get("models") if isinstance(provider, dict) else None
+    if not isinstance(metadata, dict):
+        return {}
+    return _clean_limits(
+        {
+            model: (metadata[model] or {}).get("limit")
+            for model in models
+            if isinstance(metadata.get(model), dict)
+        }
+    )
+
+
+def _clean_limits(value: Any) -> dict[str, dict[str, int]]:
+    """Keep only usable ``context``/``output`` numbers, so a junk cache cannot leak into a hook."""
+    if not isinstance(value, dict):
+        return {}
+    limits: dict[str, dict[str, int]] = {}
+    for model, entry in value.items():
+        if not isinstance(model, str) or not isinstance(entry, dict):
+            continue
+        numbers = {
+            key: number
+            for key, number in entry.items()
+            if key in ("context", "output")
+            and isinstance(number, int)
+            and not isinstance(number, bool)
+            and number > 0
+        }
+        if numbers:
+            limits[model] = numbers
+    return limits
+
+
 def _model_cache_path() -> Path:
     return get_hermes_home() / "cache" / "oc-free-provider" / "models.json"
 
 
-def _load_model_cache() -> list[str]:
+def _load_model_cache() -> tuple[list[str], dict[str, dict[str, int]]]:
+    """The cached discovery snapshot as ``(models, limits)``; a legacy bare list reads as ids only."""
     try:
-        models = json.loads(_model_cache_path().read_text(encoding="utf-8"))
+        cached = json.loads(_model_cache_path().read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return []
+        return [], {}
+    models = cached.get("models") if isinstance(cached, dict) else cached
     if not isinstance(models, list) or any(
         not isinstance(model, str) or not model for model in models
     ):
-        return []
-    return sorted(dict.fromkeys(models))
+        return [], {}
+    limits = cached.get("limits") if isinstance(cached, dict) else None
+    return sorted(dict.fromkeys(models)), _clean_limits(limits)
 
 
-def _save_model_cache(models: list[str]) -> None:
+def _save_model_cache(models: list[str], limits: dict[str, dict[str, int]]) -> None:
     path = _model_cache_path()
     temporary = path.with_suffix(f".{secrets.token_hex(4)}.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary.write_text(json.dumps(models) + "\n", encoding="utf-8")
+        temporary.write_text(
+            json.dumps({"models": models, "limits": limits}) + "\n", encoding="utf-8"
+        )
         temporary.replace(path)
     except OSError:
         try:
@@ -369,22 +416,42 @@ def _save_model_cache(models: list[str]) -> None:
 
 
 def _models_for_process(timeout: float) -> tuple[str, ...]:
-    global _MODEL_SNAPSHOT
+    global _MODEL_SNAPSHOT, _CATALOG_LIMITS
     with _MODEL_SNAPSHOT_LOCK:
         if _MODEL_SNAPSHOT is None:
+            limits: dict[str, dict[str, int]] = {}
             try:
-                models = _free_live_models(
-                    _json_get(MODELS_URL, timeout),
-                    _json_get(MODELS_DEV_URL, timeout),
-                )
+                zen = _json_get(MODELS_URL, timeout)
+                catalog = _json_get(MODELS_DEV_URL, timeout)
+                models = _free_live_models(zen, catalog)
+                limits = _free_live_limits(models, catalog)
             except (OSError, ValueError, urllib.error.URLError):
                 models = []
             if models:
-                _save_model_cache(models)
+                _save_model_cache(models, limits)
             else:
-                models = _load_model_cache() or list(FALLBACK_MODELS)
+                models, limits = _load_model_cache()
+                models = models or list(FALLBACK_MODELS)
             _MODEL_SNAPSHOT = tuple(models)
+            _CATALOG_LIMITS = limits
         return _MODEL_SNAPSHOT
+
+
+def catalog_limit(model: str | None, key: str) -> int | None:
+    """A free model's own catalog ``limit`` (``context``/``output``), or None while cold.
+
+    Cache-only by design: the provider hooks that read it run on the session's hot path, so the
+    worst case is one small file read, never a request.
+    """
+    global _CATALOG_LIMITS
+    if not model:
+        return None
+    with _MODEL_SNAPSHOT_LOCK:
+        if not _CATALOG_LIMITS:
+            _CATALOG_LIMITS = _load_model_cache()[1]
+        entry = _CATALOG_LIMITS.get(str(model)) or {}
+        value = entry.get(key)
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def _session_id() -> str:

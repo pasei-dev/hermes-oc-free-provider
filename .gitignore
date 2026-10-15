@@ -5,3 +5,4 @@ __pycache__/
 .DS_Store
 # written by `hermes plugins install`, never by hand
 .hermes-catalog.json
+.worktrees/
