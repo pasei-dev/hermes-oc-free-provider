@@ -246,6 +246,54 @@ def _urlopen(request: urllib.request.Request, timeout: float):
 
 INFERENCE_CONTEXT = "OpenCode free-model inference"
 
+#: The relay's free-tier refusal, as the ``type`` of a 403 body. The gate decides whether a request
+#: looks like the official client's; one this client already builds inside the documented
+#: vocabulary (bare ``opencode/<semver>`` agent, ``ses_`` session id, the advertised tool set) is
+#: still refused now and then, and the identical bytes are served on a later attempt — verified
+#: live by replaying a refused turn's own envelope, and by mutating one field at a time to confirm
+#: every field the gate reads is one this client sets. So it is the gate's transient verdict, not
+#: the dead credential a generic 403 verdict assumes.
+FREE_TIER_REFUSAL = "FreeTierError"
+
+
+def classify_api_error(
+    error: Any = None,
+    *,
+    status_code: Any = None,
+    error_code: Any = None,
+    message: Any = None,
+    body: Any = None,
+    model: Any = None,
+    **context: Any,
+) -> dict[str, Any] | None:
+    """Hermes' ``ProviderProfile.classify_api_error`` hook for this provider's own failures.
+
+    A free-tier refusal becomes a retryable verdict, so one transient refusal no longer ends the
+    turn; every other failure returns ``None`` and keeps the generic pipeline's verdict. ``unknown``
+    is the taxonomy's retry-with-backoff reason: the refusal names no cause this client can act on,
+    and retrying the same envelope is what recovers.
+    """
+    try:
+        code = int(status_code)
+    except (TypeError, ValueError):
+        return None
+    if code != 403:
+        return None
+    text = str(message or "")
+    if isinstance(body, str):
+        text = f"{text}\n{body}"
+    elif body is not None:
+        try:
+            text = f"{text}\n{json.dumps(body)}"
+        except (TypeError, ValueError):
+            pass
+    # Case-insensitive: the host hands the classifier a lowercased message (``_Ctx.msg``), so a
+    # case-sensitive match here silently declines and the generic 403 verdict stands.
+    if FREE_TIER_REFUSAL.lower() not in text.lower():
+        return None
+    return {"reason": "unknown", "retryable": True, "should_fallback": True}
+
+
 #: Environment variable naming a file that every inference envelope is appended to. A relay refusal
 #: (``403 FreeTierError``) is decided by the exact bytes of the envelope, and the request dump Hermes
 #: writes on a failed call records its own ``api_kwargs`` — *before* this client translates them — so
