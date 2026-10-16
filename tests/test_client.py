@@ -824,6 +824,84 @@ class ClientTests(unittest.TestCase):
                 oc.chat.completions.create(model="m", messages=[], tools=[])
         self.assertEqual(caught.exception.status_code, 429)
 
+    def test_free_tier_refusal_is_classified_retryable(self):
+        # The relay's gate refuses a fingerprint-correct request now and then, and serves the same
+        # bytes later (replaying a refused turn's own envelope returns 200). The generic 403 verdict
+        # ends the turn on it as a dead credential; the hook must make it retryable instead.
+        refusal = json.dumps(
+            {"type": "error", "error": {"type": "FreeTierError", "message": "can only be used from within OpenCode"}}
+        )
+        verdict = client.classify_api_error(
+            None, status_code=403, message=f"OpenCode free-model inference failed with HTTP 403: {refusal}"
+        )
+        self.assertIsNotNone(verdict)
+        assert verdict is not None  # narrow for the type checker; the assertion above is the test
+        self.assertTrue(verdict["retryable"])
+        self.assertTrue(verdict["should_fallback"])
+        # The host lowercases the message before the hook sees it (``_Ctx.msg``), so that form is
+        # the one that actually arrives in production.
+        lowered = client.classify_api_error(
+            None,
+            status_code=403,
+            message="opencode free-model inference failed with http 403: "
+            '{"type":"error","error":{"type":"freetiererror"}}',
+            body={"error": {"type": "FreeTierError"}},
+        )
+        self.assertIsNotNone(lowered)
+
+    def test_other_failures_keep_the_host_verdict(self):
+        # Only the free-tier refusal is transient. A body naming something else — or another status —
+        # must return None so the generic pipeline (auth, billing, format) still decides.
+        self.assertIsNone(
+            client.classify_api_error(None, status_code=403, message="invalid api key")
+        )
+        self.assertIsNone(
+            client.classify_api_error(
+                None, status_code=401, message=json.dumps({"error": {"type": "FreeTierError"}})
+            )
+        )
+        self.assertIsNone(client.classify_api_error(None, status_code=None, message="boom"))
+
+    def test_classification_verdict_names_a_host_taxonomy_reason(self):
+        # ``reason`` is a FailoverReason *name*, and an unknown one silently drops the verdict.
+        try:
+            from agent.error_classifier import FailoverReason  # type: ignore[import-not-found]
+        except ImportError:  # host tree not on sys.path: the seam itself cannot be checked here
+            self.skipTest("host error taxonomy unavailable")
+        verdict = client.classify_api_error(None, status_code=403, message="FreeTierError")
+        assert verdict is not None
+        FailoverReason(verdict["reason"])
+
+    def test_profile_registers_the_hook(self):
+        # The hook rides on the dataclass field, so it must be passed to the constructor: a subclass
+        # method of the same name would be consumed as that field's default and called unbound.
+        try:
+            import importlib.util as ilu
+            import sys as _sys
+
+            spec = ilu.spec_from_file_location(
+                "oc_free_provider_under_test",
+                ROOT / "__init__.py",
+                submodule_search_locations=[str(ROOT)],
+            )
+            assert spec is not None and spec.loader is not None
+            module = ilu.module_from_spec(spec)
+            # `from . import hermes_oc_client` resolves through sys.modules, so a package has to be
+            # registered under its own name before its body runs.
+            _sys.modules[spec.name] = module
+            try:
+                spec.loader.exec_module(module)
+            finally:
+                _sys.modules.pop(spec.name, None)
+        except ImportError as exc:  # host provider registry not reachable
+            self.skipTest(f"host provider API unavailable: {exc}")
+        self.assertIs(module.opencode_free.classify_api_error, module.hermes_oc_client.classify_api_error)
+        # Called through the profile it must behave as the hook does — a method of that name would be
+        # swallowed as the dataclass field's default and arrive here unbound.
+        verdict = module.opencode_free.classify_api_error(None, status_code=403, message="FreeTierError")
+        assert verdict is not None
+        self.assertTrue(verdict["retryable"])
+
     def test_empty_and_content_filtered_responses_fail_explicitly(self):
         oc = client.OpenCodeClient()
         with mock.patch.object(client, "_urlopen", return_value=sse()):

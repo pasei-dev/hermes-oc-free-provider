@@ -132,6 +132,11 @@ opencode_free = OpenCodeFreeProfile(
     process_command_env_vars=(),
     fallback_models=FALLBACK_MODELS,
     default_aux_model=DEFAULT_MODEL,
+    # The relay's free-tier refusal is transient (see ``hermes_oc_client.classify_api_error``), and a
+    # generic 403 verdict would end the turn on it. Passed as a constructor argument, not defined as
+    # a method: ``classify_api_error`` is a dataclass *field* on ``ProviderProfile``, so a subclass
+    # method of that name is consumed as the field's default and the call would land unbound.
+    classify_api_error=hermes_oc_client.classify_api_error,
     # ``supports_reasoning`` is what makes Hermes send the dial and render the thinking blocks at
     # all; the per-model vocabulary comes from ``supported_reasoning_efforts`` below.
     model_capabilities={
