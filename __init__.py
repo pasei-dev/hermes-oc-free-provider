@@ -1,24 +1,28 @@
 """Hermes model-provider registration for OpenCode."""
 
-# ruff: noqa: E402, I001 -- Hermes imports plugin directories without a package name.
+# ruff: noqa: E402 -- the client module is imported below, before its names are used.
 
 from __future__ import annotations
 
 import sys
-from pathlib import Path
 from typing import Any
 
-_PLUGIN_DIR = Path(__file__).parent
-if str(_PLUGIN_DIR) not in sys.path:
-    sys.path.insert(0, str(_PLUGIN_DIR))
+# Import the client *relative to this file*, never as a bare ``hermes_oc_client``. Hermes loads one
+# copy of a user plugin per profile home into a single process (one gateway serves every profile),
+# so a bare name makes the copies share one ``sys.modules`` entry: the second copy to load silently
+# imports the *first* copy's file. Once the copies drift apart that is fatal — the newer copy's
+# ``from hermes_oc_client import catalog_limit`` raised ImportError, so the provider never
+# registered and the model picker showed it with no models. Hermes imports a plugin directory as a
+# package (``submodule_search_locations`` on the plugin dir), which is what lets this resolve to
+# this copy's own file.
+from . import hermes_oc_client  # noqa: E402
 
-from hermes_oc_client import (  # type: ignore[import-not-found]
-    DEFAULT_MODEL,
-    FALLBACK_MODELS,
-    LOGICAL_BASE_URL,
-    OpenCodeClient,
-    catalog_limit,
-)
+DEFAULT_MODEL = hermes_oc_client.DEFAULT_MODEL
+FALLBACK_MODELS = hermes_oc_client.FALLBACK_MODELS
+LOGICAL_BASE_URL = hermes_oc_client.LOGICAL_BASE_URL
+OpenCodeClient = hermes_oc_client.OpenCodeClient
+catalog_limit = hermes_oc_client.catalog_limit
+
 from providers import register_provider  # type: ignore[import-not-found]
 from providers.base import ProviderProfile  # type: ignore[import-not-found]
 
@@ -36,9 +40,7 @@ def _takes_reasoning_effort(model: str | None) -> bool:
     ("unknown parameter `reasoning_effort`") for it; they stream their reasoning as
     ``reasoning_details`` without being asked.
     """
-    from hermes_oc_client import RESPONSES_MODELS
-
-    return bool(model) and str(model) not in RESPONSES_MODELS
+    return bool(model) and str(model) not in hermes_oc_client.RESPONSES_MODELS
 
 
 class OpenCodeFreeProfile(ProviderProfile):

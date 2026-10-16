@@ -9,6 +9,7 @@ is pinned rather than left to the client's discretion.
 from __future__ import annotations
 
 import importlib.util
+import shutil
 import sys
 import tempfile
 import types
@@ -19,10 +20,21 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-_SPEC = importlib.util.spec_from_file_location("oc_free_provider_plugin", ROOT / "__init__.py")
-assert _SPEC is not None and _SPEC.loader is not None
-plugin = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(plugin)
+
+def load_plugin(name: str = "oc_free_provider_plugin", plugin_dir: Path | None = None):
+    """Execute a plugin copy's ``__init__.py`` the way Hermes does: as its own package."""
+    directory = plugin_dir or ROOT
+    spec = importlib.util.spec_from_file_location(
+        name, directory / "__init__.py", submodule_search_locations=[str(directory)]
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+plugin = load_plugin()
 
 CHAT_MODEL = "deepseek-v4.1-flash-free"
 RESPONSES_MODEL = "muse-spark-1.3-contributor-free"
@@ -84,7 +96,9 @@ class CatalogLimitTests(unittest.TestCase):
     """What the context meter, the output cap and the cost line read for a free model."""
 
     def setUp(self):
-        import hermes_oc_client as client
+        # The module the plugin itself loaded, not the bare `hermes_oc_client` name: the plugin
+        # imports its client relative to its own package (see `__init__`).
+        client = plugin.hermes_oc_client
 
         self.client = client
         self._saved = dict(client._CATALOG_LIMITS)
@@ -186,6 +200,77 @@ class ModelCacheTests(unittest.TestCase):
     def test_a_legacy_ids_only_file_still_reads(self):
         Path(self.tmp.name, "models.json").write_text('["a-free", "a-free", "b-free"]')
         self.assertEqual(self.client._load_model_cache(), (["a-free", "b-free"], {}))
+
+
+class ClientIsolationTests(unittest.TestCase):
+    """One process, several profile homes: each home's copy of this plugin must stand alone.
+
+    The live failure this pins: the gateway loads the plugin once per profile home, and the two
+    copies had drifted apart. The second copy's bare ``import hermes_oc_client`` resolved to the
+    first copy's already-imported module, so its ``from hermes_oc_client import catalog_limit``
+    raised ImportError, the provider never registered, and the model picker listed it with no
+    models.
+    """
+
+    def _write_a_drifted_copy(self, tmp: str) -> Path:
+        """An older home's copy: bare client import, and a client without ``catalog_limit``."""
+        stale = Path(tmp) / "oc-free-provider"
+        stale.mkdir()
+        (stale / "hermes_oc_client.py").write_text(
+            "DEFAULT_MODEL = 'big-pickle'\n"
+            "FALLBACK_MODELS = (DEFAULT_MODEL,)\n"
+            "LOGICAL_BASE_URL = 'https://opencode.ai/inference/v1/chat/completions'\n"
+            "class OpenCodeClient:  # no catalog_limit yet\n"
+            "    pass\n",
+            encoding="utf-8",
+        )
+        (stale / "__init__.py").write_text(
+            "import sys\n"
+            "from pathlib import Path\n"
+            "sys.path.insert(0, str(Path(__file__).parent))\n"
+            "from hermes_oc_client import DEFAULT_MODEL, FALLBACK_MODELS, LOGICAL_BASE_URL\n",
+            encoding="utf-8",
+        )
+        return stale
+
+    def test_a_drifted_first_copy_does_not_break_the_second(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # Reproduce the gateway's state: nothing has imported the client under its bare name
+            # yet, so the first copy to load is the one that claims it.
+            saved = sys.modules.pop("hermes_oc_client", None)
+
+            def _restore():
+                if saved is not None:
+                    sys.modules["hermes_oc_client"] = saved
+                else:
+                    sys.modules.pop("hermes_oc_client", None)
+
+            self.addCleanup(_restore)
+            stale = self._write_a_drifted_copy(tmp)
+            load_plugin("oc_free_home_old", stale)
+            self.addCleanup(sys.modules.pop, "oc_free_home_old", None)
+            # The drifted copy claimed the bare name, with its own client under it.
+            self.assertFalse(hasattr(sys.modules["hermes_oc_client"], "catalog_limit"))
+
+            second = load_plugin("oc_free_home_new", ROOT)
+            self.addCleanup(sys.modules.pop, "oc_free_home_new", None)
+
+            # The newer copy must not have resolved its client through that bare name.
+            self.assertTrue(callable(second.catalog_limit))
+            self.assertIsNot(second.hermes_oc_client, sys.modules["hermes_oc_client"])
+            self.assertEqual(second.FALLBACK_MODELS, plugin.FALLBACK_MODELS)
+
+    def test_each_copy_keeps_its_own_client_module(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            copy = Path(tmp) / "oc-free-provider"
+            shutil.copytree(ROOT, copy, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+            other = load_plugin("oc_free_copy", copy)
+            self.addCleanup(sys.modules.pop, "oc_free_copy", None)
+            self.assertIsNot(other.hermes_oc_client, plugin.hermes_oc_client)
+            self.assertEqual(
+                other.hermes_oc_client.__file__,
+                str(copy / "hermes_oc_client.py"),
+            )
 
 
 if __name__ == "__main__":
