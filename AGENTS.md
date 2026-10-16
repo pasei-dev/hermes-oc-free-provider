@@ -62,6 +62,10 @@ Always
 - Prove a wire change against the live relay. The suite mocking `_urlopen` is what lets a stale envelope
   stay green.
 - Keep the request in one place. A second place that builds it is how the header set drifts apart.
+- Load the client through `__init__._load_client()`. Hermes loads one copy of this plugin per profile
+  home into one process (one gateway serves every profile), so a bare `import hermes_oc_client` lets the
+  copies drift into each other's namespace — the second copy then imports the first copy's file, its
+  registration raises, and the model picker shows the provider with no models.
 
 Ask first
 

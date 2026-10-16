@@ -35,16 +35,19 @@ OPENCODE_USER_AGENT = f"opencode/{OPENCODE_VERSION}"
 DEFAULT_MODEL = "big-pickle"
 FALLBACK_MODELS = (
     DEFAULT_MODEL,
-    "ling-3.0-flash-fin-free",
-    "mimo-v2.5-free",
-    "muse-spark-1.2-contributor-free",
+    "cat-jam-free",
+    "deepseek-v4.1-flash-free",
+    "glm-5.3-flash-free",
+    "ll-alpha-free",
+    "longcat-2.5-preview-free",
+    "mimo-v2.6-flash-free",
     "muse-spark-1.3-contributor-free",
-    "nemotron-3-ultra-free",
     "nemotron-3.5-lightning-free",
+    "nemotron-3.5-super-vl-free",
+    "space-bunny-free",
 )
 RESPONSES_MODELS = frozenset(
     {
-        "muse-spark-1.2-contributor-free",
         "muse-spark-1.3-contributor-free",
     }
 )
