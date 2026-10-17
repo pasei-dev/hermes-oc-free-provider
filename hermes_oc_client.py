@@ -301,10 +301,120 @@ def _request_shape(request: urllib.request.Request) -> dict[str, Any]:
     }
 
 
+@contextlib.contextmanager
+def _file_lock(path: Path) -> Iterator[None]:
+    """A cross-process lock around a read-modify-write of this provider's own files.
+
+    Two writers meet on this cache in practice — the host process building requests and a probe
+    process replaying them — and an unlocked read-modify-write interleaves: one reader keeps a
+    prefix while the other replaces the file, leaving a line cut in half, and the evidence is lost
+    exactly when it is wanted. ``fcntl`` is POSIX-only, so where it is absent the write stays
+    unlocked rather than the call failing.
+    """
+    try:
+        import fcntl
+    except ImportError:
+        yield
+        return
+    with open(path, "a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _connection_facts(response: Any) -> dict[str, Any]:
+    """What carried the refusal, dug out of its own response: the peer's view of the connection.
+
+    The one thing a request's shape cannot say is *which* connection was refused, and the gate sees
+    the connection we make. best-effort and shape-only; every probe here is guarded because the
+    response may already be closed.
+
+    urllib hands an ``HTTPError`` the ``HTTPResponse`` itself, so the socket sits four hops down:
+    ``HTTPError.fp`` (the response) -> ``.fp`` (a ``BufferedReader``) -> ``.raw`` (``SocketIO``) ->
+    ``._sock`` (the ``SSLSocket``). A chain that does not resolve answers nothing rather than
+    raising.
+    """
+    node: Any = response
+    for attribute in ("fp", "fp", "raw", "_sock"):
+        node = getattr(node, attribute, None)
+        if node is None:
+            return {}
+    facts: dict[str, Any] = {}
+    for name, reader in (("local", "getsockname"), ("peer", "getpeername")):
+        with contextlib.suppress(Exception):
+            address = getattr(node, reader)()
+            facts[name] = f"{address[0]}:{address[1]}"
+    with contextlib.suppress(Exception):
+        if callable(node.version):
+            facts["tls"] = node.version()
+    with contextlib.suppress(Exception):
+        cipher = node.cipher()
+        if cipher:
+            facts["cipher"] = str(cipher[0])
+    with contextlib.suppress(Exception):
+        if callable(node.selected_alpn_protocol):
+            facts["alpn"] = node.selected_alpn_protocol()
+    for name in ("session_reused", "server_hostname"):
+        value = getattr(node, name, None)
+        if isinstance(value, (str, bool)):
+            facts[name] = value
+    return facts
+
+
+def _refusal_evidence(exc: urllib.error.HTTPError) -> dict[str, Any]:
+    """The refusal's own side of the exchange: its headers, and the connection that carried them."""
+    evidence: dict[str, Any] = {}
+    headers = getattr(exc, "headers", None)
+    if headers is not None:
+        with contextlib.suppress(Exception):
+            evidence["response_headers"] = {str(key): str(value) for key, value in headers.items()}
+    facts = _connection_facts(exc)
+    if facts:
+        evidence["connection"] = facts
+    return evidence
+
+
+def _probe_identical(
+    request: urllib.request.Request, timeout: float
+) -> tuple[int | None, Any, float]:
+    """Re-open the *identical* bytes once, on a connection of its own, after a free-tier refusal.
+
+    The verdict is not on the bytes: a refused turn's own envelope streams ``200`` from a fresh
+    process in the same minute (measured live, 2026-10-17). So the bit that separates "another
+    attempt fixes it" from "restart the host" is whether this same process, on a brand-new
+    connection, is served — and it is recorded either way. A served response *is* the turn's own,
+    so the probe is a fix and a diagnostic at once; it is never spent on a request that is not
+    already refused, and never on one whose envelope the recovery just rebuilt.
+
+    ``None`` as the status means the connection itself failed.
+    """
+    started = time.monotonic()
+    try:
+        response = _urlopen(request, timeout)
+    except urllib.error.HTTPError as exc:
+        with contextlib.suppress(Exception):
+            exc.read()
+        return exc.code, None, time.monotonic() - started
+    except (urllib.error.URLError, OSError):
+        return None, None, time.monotonic() - started
+    return 200, response, time.monotonic() - started
+
+
 def _record_refusal(
-    status: int, response: str, request: urllib.request.Request | None = None
+    status: int,
+    response: str,
+    request: urllib.request.Request | None = None,
+    evidence: dict[str, Any] | None = None,
+    probe: tuple[int | None, Any, float] | None = None,
 ) -> None:
     """Append a refused call to this provider's own log, newest last, keeping the last few.
+
+    *evidence* is the refusal's own side of the exchange and *probe* the verdict on re-opening the
+    identical bytes on a fresh connection; both are shape, never the conversation. The write is
+    locked, because a host and a probe process write this file at the same time.
 
     Never raises: a diagnostic must not be able to turn one refusal into two.
     """
@@ -317,10 +427,15 @@ def _record_refusal(
         }
         if request is not None:
             entry.update(_request_shape(request))
-        previous = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
-        lines = [*previous[-(REFUSAL_LOG_LINES - 1) :], json.dumps(entry)]
+        if evidence:
+            entry.update(evidence)
+        if probe is not None:
+            entry["probe"] = {"status": probe[0], "seconds": round(probe[2], 3)}
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        with _file_lock(path):
+            previous = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+            lines = [*previous[-(REFUSAL_LOG_LINES - 1) :], json.dumps(entry)]
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     except (OSError, TypeError, ValueError):
         pass
 
@@ -337,7 +452,9 @@ INFERENCE_CONTEXT = "OpenCode free-model inference"
 #: still refused now and then, and the identical bytes are served on a later attempt — verified
 #: live by replaying a refused turn's own envelope, and by mutating one field at a time to confirm
 #: every field the gate reads is one this client sets. So it is the gate's transient verdict, not
-#: the dead credential a generic 403 verdict assumes.
+#: the dead credential a generic 403 verdict assumes. Measured 2026-10-17: a refused turn's own
+#: bytes stream 200 from a fresh process in the same minute, so the refusal is re-opened once on a
+#: connection of its own (``_probe_identical``) and that verdict is recorded either way.
 FREE_TIER_REFUSAL = "FreeTierError"
 
 
@@ -463,14 +580,28 @@ def _sse_events(
         try:
             response = _urlopen(request, timeout)
         except urllib.error.HTTPError as exc:
+            # Before the body is read: reading it closes the response, and the connection facts are
+            # only reachable through the response it holds.
+            evidence = _refusal_evidence(exc)
             body_text = exc.read().decode("utf-8", "replace")
-            _record_refusal(exc.code, body_text, request)
-            if recover is not None and not retried:
-                retried = True
-                if replacement := recover(exc.code, body_text, request):
-                    request = replacement
-                    continue
-            raise _status_error(exc.code, body_text, INFERENCE_CONTEXT) from exc
+            replacement = (
+                recover(exc.code, body_text, request) if recover is not None and not retried else None
+            )
+            retried = retried or recover is not None
+            free_tier = exc.code == 403 and FREE_TIER_REFUSAL.lower() in body_text.lower()
+            probe = (
+                _probe_identical(request, timeout)
+                if free_tier and replacement is None
+                else None
+            )
+            _record_refusal(exc.code, body_text, request, evidence=evidence, probe=probe)
+            if replacement is not None:
+                request = replacement
+                continue
+            if probe is not None and probe[0] == 200 and probe[1] is not None:
+                response = probe[1]
+            else:
+                raise _status_error(exc.code, body_text, INFERENCE_CONTEXT) from exc
         except urllib.error.URLError as exc:
             raise OpenCodeError(f"{INFERENCE_CONTEXT} failed: {exc.reason}") from exc
         tracked = owner._track_inflight(response) if owner is not None else contextlib.nullcontext()

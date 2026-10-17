@@ -18,8 +18,9 @@ The symbols a change usually touches: `_inference_request` and `_sse_events` (th
 built and read), `_session_id` (the relay-validated id), `_wire_tools` and `_translate_tool` (the
 translation pairs, both directions), the `COMPAT_TOOL_*` alias tables, `_models_for_process` (discovery
 with its cache and fallback chain), and the handshake pair `client_version` (what the User-Agent claims,
-derived) with `_refusal_recovery` / `_record_refusal` (what a refusal re-derives, and what it leaves
-behind).
+derived) with `_refusal_recovery` / `_record_refusal` / `_probe_identical` (what a refusal re-derives,
+what it leaves behind, and the same-process re-open on a fresh connection that either fixes the turn or
+names the restart).
 
 ## Commands
 
@@ -55,10 +56,16 @@ refused while a fresh process streams *byte-identical* requests in the same minu
 wire, replay the failing turn's own `request_dump_local-*.json` body through the plugin's client in a fresh
 process — if that streams `200`, the envelope is right and the host process is what to restart. A refusal
 writes itself down for exactly this: `<hermes home>/cache/oc-free-provider/refusals.jsonl` holds the last
-20, each with its status, the relay's own words, and the refused request's *shape* (URL, headers, model,
-tool names, byte count, body hash — never the conversation). Set `HERMES_OC_DEBUG=<file>` for the full
-bytes, or leave a file at `<hermes home>/cache/oc-free-provider/capture` to arm the same capture from disk
-in a host whose environment cannot be changed after it starts.
+20, each with its status, the relay's own words, the refused request's *shape* (URL, headers, model, tool
+names, byte count, body hash — never the conversation), the *response's* own headers and the connection
+that carried them (local/peer address, TLS version and cipher, ALPN, whether the session was reused), and a
+`probe` verdict. `probe.status: 200` says those *same bytes* were served when the client re-opened them on
+a fresh connection of its own a moment later — so the envelope is right and the **long-lived host process**
+is what to restart; `403` says the gate refused the identical bytes twice, which is the relay's answer that
+minute. The re-open is a fix and a diagnostic at once: when it is served, that stream *is* the turn. Set
+`HERMES_OC_DEBUG=<file>` for the full bytes, or leave a file at
+`<hermes home>/cache/oc-free-provider/capture` to arm the same capture from disk in a host whose environment
+cannot be changed after it starts.
 
 ## Git
 
@@ -93,8 +100,8 @@ Never
 
 ## The relay's checks
 
-Undocumented, enforced per request, and moved without notice. All four were verified against the live relay
-on 2026-10-15:
+Undocumented, enforced per request, and moved without notice. All five were verified against the live relay,
+items 1–4 on 2026-10-15 and item 5 on 2026-10-17:
 
 1. Base URL `https://opencode.ai/inference/v1` for `/chat/completions`, `/responses` and `/models`. The
    older `/zen/v1` answers `FreeTierError` for every shape. `models.opencode.ai/api.json` publishes
@@ -110,6 +117,9 @@ on 2026-10-15:
    cache warm.
 4. Every advertised tool carries a non-empty parameter schema. An alias whose Hermes tool is missing still
    needs OpenCode's real schema, which is why `_compat_tool` uses `COMPAT_TOOL_PARAMETERS`.
+5. The tool list is never empty: a body that advertises no tools is refused `403 FreeTierError`, identically
+   to a malformed one — the two are the same refusal, which is what makes a tool-less body the cheapest way
+   to *measure* the gate without burning a real turn.
 
 The reasoning dial is the relay's vocabulary too, and it moves in both directions: measured 2026-10-17,
 `none` (thinking off for real), `minimal`, `low`, `medium`, `high`, `max`, `xhigh` and `ultra` all stream,
@@ -117,8 +127,10 @@ where an earlier pass had measured five of them and dropped the rest — includi
 thinking-off `none`, which silently kept thinking. So the dial is forwarded as it is and a
 `400 [unsupported_value]` is what teaches us a model that has narrowed: one retry without it, remembered
 per model in `handshake.json`. A refusal from any of these causes is re-derived once inside the call
-(`_refusal_recovery`) and then left to Hermes' retry policy — a 403 with an *unchanged* envelope is not
-retried in-process, because the gate refuses identical bytes in bursts and that is the host's business.
+(`_refusal_recovery`); a `403 FreeTierError` instead re-opens the *identical* bytes once on a connection of
+its own (`_probe_identical`) and, when that is served, continues the turn on it. What is deliberately not
+done is anything past that: a served re-open is the fix, a refused one is the relay's answer, and beyond it
+the gate refuses identical bytes in bursts — a retry loop is Hermes' policy, not this client's business.
 
 To re-derive these after a change, capture rather than guess: point the official CLI's provider `baseURL`
 at a local catch-proxy through `OPENCODE_CONFIG`, record the request it sends, then replay it against the
