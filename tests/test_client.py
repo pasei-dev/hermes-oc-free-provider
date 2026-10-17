@@ -371,12 +371,14 @@ class ClientTests(unittest.TestCase):
         handshake = json.loads(self.cache_path.with_name("handshake.json").read_text())
         self.assertEqual(handshake["floor"], "3.1.0")
 
-    def test_free_tier_refusal_with_an_unchanged_envelope_is_recorded_not_retried(self):
-        """Identical bytes get no in-process retry; the host's policy owns that, and we leave evidence.
+    def test_free_tier_refusal_is_recorded_and_the_identical_bytes_reopened_once(self):
+        """The envelope is never *rebuilt* against this refusal; the identical bytes are re-opened.
 
         The refusal is the relay's verdict on bytes this client built, and the host that built them
         (the gateway) may carry a module nobody can reach into — so the record on disk is what a
-        later reader gets, and it carries the request's shape rather than its conversation.
+        later reader gets, and it carries the request's shape rather than its conversation. Measured
+        2026-10-17: those same bytes stream 200 from a fresh process in the same minute, so the one
+        re-open is the measurement that says whether the verdict is on the bytes or on the host.
         """
         refusal = json.dumps(
             {
@@ -407,11 +409,19 @@ class ClientTests(unittest.TestCase):
                     tools=[],
                 )
         self.assertEqual(caught.exception.status_code, 403)
-        self.assertEqual(len(attempts), 1)
+        # The refused request, then the one re-open of the same bytes: never a rebuilt envelope.
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(attempts[0].data, attempts[1].data)
+        self.assertEqual(
+            attempts[0].get_header("X-opencode-session"),
+            attempts[1].get_header("X-opencode-session"),
+        )
         record = json.loads(
             self.cache_path.with_name(client.REFUSAL_LOG).read_text().splitlines()[-1]
         )
         self.assertEqual(record["status"], 403)
+        self.assertEqual(record["probe"]["status"], 403)
+        self.assertIn("response_headers", record)
         self.assertIn("FreeTierError", record["response"])
         self.assertEqual(record["url"], client.DIRECT_URL)
         self.assertEqual(record["body"]["model"], "deepseek-v4.1-flash-free")
@@ -431,6 +441,79 @@ class ClientTests(unittest.TestCase):
             ],
         )
         self.assertNotIn("a secret prompt", json.dumps(record))
+
+    def test_free_tier_refusal_served_on_a_fresh_connection_is_the_turn(self):
+        """The re-open is a fix and a diagnostic at once: served, its stream *is* the answer.
+
+        Measured 2026-10-17: the bytes a gateway was refused on stream 200 from a fresh process in
+        the same minute, so a refusal is re-opened once — identical bytes, a connection of its own.
+        When that is served the turn continues on it, and the record still names the refusal.
+        """
+        refusal = json.dumps({"type": "error", "error": {"type": "FreeTierError"}})
+        attempts = []
+
+        def fake_open(request, timeout):
+            attempts.append(request)
+            if len(attempts) == 1:
+                raise urllib.error.HTTPError(  # type: ignore[arg-type]
+                    client.DIRECT_URL, 403, "forbidden", {}, io.BytesIO(refusal.encode())
+                )
+            return sse(
+                {"model": "m", "choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}
+            )
+
+        with (
+            mock.patch.object(client, "_VERSION", None),
+            mock.patch.object(client, "_installed_client_version", return_value=None),
+            mock.patch.object(client, "_urlopen", side_effect=fake_open),
+        ):
+            response = client.OpenCodeClient().chat.completions.create(
+                model="deepseek-v4.1-flash-free",
+                messages=[{"role": "user", "content": "probe"}],
+                tools=[],
+            )
+        self.assertEqual(response.choices[0].message.content, "ok")
+        self.assertEqual(len(attempts), 2)
+        # Identical, not rebuilt: same bytes and the same session id.
+        self.assertEqual(attempts[0].data, attempts[1].data)
+        self.assertEqual(
+            attempts[0].get_header("X-opencode-session"),
+            attempts[1].get_header("X-opencode-session"),
+        )
+        record = json.loads(
+            self.cache_path.with_name(client.REFUSAL_LOG).read_text().splitlines()[-1]
+        )
+        self.assertEqual(record["status"], 403)
+        self.assertEqual(record["probe"]["status"], 200)
+
+    def test_refusal_log_keeps_every_line_whole_under_concurrent_writers(self):
+        """The log is a read-modify-write, and a host process writes it beside a probe process.
+
+        Unlocked, one writer's prefix survives into the other's replacement and a line is cut in
+        half — which is how a real reader lost an entry on 2026-10-17. Locked, every kept line is
+        whole.
+        """
+
+        def writer(index):
+            for step in range(6):
+                client._record_refusal(400 + index, f"refusal {index}-{step}")
+
+        threads = [threading.Thread(target=writer, args=(index,)) for index in range(3)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        lines = [
+            line
+            for line in self.cache_path.with_name(client.REFUSAL_LOG)
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        ]
+        self.assertTrue(lines)
+        self.assertLessEqual(len(lines), client.REFUSAL_LOG_LINES)
+        for line in lines:
+            self.assertIn("status", json.loads(line))
 
     def test_free_tier_refusal_retries_once_when_the_derived_version_moved(self):
         """A refusal is the signal to stop trusting the cached version; a changed envelope retries."""
