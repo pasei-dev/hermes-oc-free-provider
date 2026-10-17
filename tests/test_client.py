@@ -59,6 +59,16 @@ def tool(name):
 
 
 class ClientTests(unittest.TestCase):
+    def setUp(self):
+        # This provider's own cache directory (the model cache, the refusal log, the handshake file)
+        # is kept off the real home: a test must never write into the live profile's cache.
+        cache_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(cache_dir.cleanup)
+        self.cache_path = Path(cache_dir.name) / "models.json"
+        home_scope = mock.patch.object(client, "_model_cache_path", return_value=self.cache_path)
+        home_scope.start()
+        self.addCleanup(home_scope.stop)
+
     def test_session_id_matches_opencode_shape(self):
         self.assertRegex(client._session_id(), r"^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$")
 
@@ -101,7 +111,8 @@ class ClientTests(unittest.TestCase):
             captured = json.loads(lines[0])
             self.assertEqual(captured["url"], client.DIRECT_URL)
             self.assertEqual(captured["headers"]["Authorization"], "Bearer public")
-            self.assertEqual(captured["headers"]["User-agent"], client.OPENCODE_USER_AGENT)
+            self.assertEqual(captured["headers"]["User-agent"], client.user_agent())
+            self.assertRegex(captured["headers"]["User-agent"], r"^opencode/\d+\.\d+\.\d+$")
             self.assertEqual(captured["headers"]["X-opencode-session"], "ses_abc")
             # The body is the exact encoded request body, not a re-serialization of it.
             self.assertEqual(
@@ -119,7 +130,7 @@ class ClientTests(unittest.TestCase):
             directory.mkdir()
             with mock.patch.dict("os.environ", {client.ENVELOPE_CAPTURE_ENV: str(directory)}):
                 request = client._inference_request(client.DIRECT_URL, {"model": "m"}, "ses_abc")
-            self.assertEqual(request.get_header("User-agent"), client.OPENCODE_USER_AGENT)
+            self.assertEqual(request.get_header("User-agent"), client.user_agent())
 
     def test_direct_request_preserves_hermes_tools_and_returns_native_call(self):
         captured = {}
@@ -198,12 +209,14 @@ class ClientTests(unittest.TestCase):
             captured["request"].headers["X-opencode-session"].startswith("ses_")
         )
 
-    def test_unsupported_reasoning_dials_never_reach_the_wire(self):
-        """The relay takes only its own five effort values; Hermes' thinking-off dial is refused.
+    def test_reasoning_dial_reaches_the_wire_as_the_host_set_it(self):
+        """The relay owns this vocabulary and it moves, so the dial is forwarded, not filtered.
 
-        Verified live: forwarding ``none`` (or ``minimal``) returns HTTP 400
-        ``[unsupported_value] ... only supports 'max', 'xhigh', 'high', 'medium' or 'low'``, so the
-        field is dropped for those and the model keeps its own default.
+        Measured live (2026-10-17): ``none`` (thinking off for real — an empty reasoning stream),
+        ``minimal``, ``low``, ``medium``, ``high``, ``max``, ``xhigh`` and even ``ultra`` all stream.
+        An earlier pass had measured five of them and dropped the rest, which quietly kept thinking
+        for a session that asked for ``none``. A model that narrows now teaches us through its own
+        400 (see ``test_refused_dial_is_dropped_retried_and_remembered``).
         """
         captured = {}
 
@@ -213,13 +226,7 @@ class ClientTests(unittest.TestCase):
                 {"model": "m", "choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}
             )
 
-        for dial, expected in (
-            ("none", None),
-            ("minimal", None),
-            ("low", "low"),
-            ("high", "high"),
-            ("xhigh", "xhigh"),
-        ):
+        for dial in ("none", "minimal", "low", "medium", "high", "max", "xhigh", "ultra"):
             with self.subTest(dial=dial), mock.patch.object(
                 client, "_urlopen", side_effect=fake_open
             ):
@@ -231,7 +238,233 @@ class ClientTests(unittest.TestCase):
                     reasoning_effort=dial,
                 )
             body = json.loads(captured["request"].data)
-            self.assertEqual(body.get("reasoning_effort"), expected)
+            self.assertEqual(body.get("reasoning_effort"), dial)
+
+    def test_refused_dial_is_dropped_retried_and_remembered(self):
+        """A model that narrowed answers ``400 [unsupported_value]``: drop the dial, retry, remember."""
+        attempts = []
+
+        def fake_open(request, timeout):
+            attempts.append(json.loads(request.data))
+            if len(attempts) == 1:
+                raise urllib.error.HTTPError(  # type: ignore[arg-type]
+                    client.DIRECT_URL,
+                    400,
+                    "bad request",
+                    {},
+                    io.BytesIO(
+                        json.dumps(
+                            {
+                                "type": "error",
+                                "error": {
+                                    "type": "invalid_request_error",
+                                    "code": "unsupported_value",
+                                    "message": "This model does not support 'ultra' reasoning effort",
+                                },
+                            }
+                        ).encode()
+                    ),
+                )
+            return sse(
+                {"model": "m", "choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}
+            )
+
+        with mock.patch.object(client, "_urlopen", side_effect=fake_open):
+            response = client.OpenCodeClient().chat.completions.create(
+                model="m",
+                messages=[{"role": "user", "content": "probe"}],
+                tools=[],
+                reasoning_effort="ultra",
+            )
+        self.assertEqual(response.choices[0].message.content, "ok")
+        self.assertEqual(attempts[0].get("reasoning_effort"), "ultra")
+        self.assertNotIn("reasoning_effort", attempts[1])
+        self.assertEqual(client._unsupported_efforts("m"), frozenset({"ultra"}))
+
+        # The learned value stays out of later calls for the same model — one retry, not one per turn.
+        attempts.clear()
+
+        def quiet_open(request, timeout):
+            attempts.append(json.loads(request.data))
+            return sse(
+                {"model": "m", "choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}
+            )
+
+        with mock.patch.object(client, "_urlopen", side_effect=quiet_open):
+            client.OpenCodeClient().chat.completions.create(
+                model="m",
+                messages=[{"role": "user", "content": "probe"}],
+                tools=[],
+                reasoning_effort="ultra",
+            )
+        self.assertNotIn("reasoning_effort", attempts[0])
+
+    def test_client_version_is_derived_from_the_installed_client(self):
+        """The User-Agent's version is derived and cached, never read from the pin alone."""
+        with (
+            mock.patch.object(client, "_VERSION", None),
+            mock.patch.object(
+                client, "_installed_client_version", return_value="2.4.1"
+            ) as installed,
+        ):
+            self.assertEqual(client.client_version(), "2.4.1")
+            self.assertEqual(client.user_agent(), "opencode/2.4.1")
+            # Inside the trust window the installed client is not asked again.
+            installed.side_effect = AssertionError("the installed client was asked twice")
+            self.assertEqual(client.client_version(), "2.4.1")
+        handshake = json.loads(self.cache_path.with_name("handshake.json").read_text())
+        self.assertEqual(handshake["version"], "2.4.1")
+        self.assertIn("checked", handshake)
+
+    def test_client_version_never_drops_below_the_pin_or_the_relays_floor(self):
+        """A stale client, or none at all, must not lower what we claim."""
+        self.cache_path.with_name("handshake.json").write_text(
+            json.dumps({"version": "1.0.0", "floor": "9.9.9", "checked": time.time()})
+        )
+        with (
+            mock.patch.object(client, "_VERSION", None),
+            mock.patch.object(client, "_installed_client_version", return_value=None),
+        ):
+            self.assertEqual(client.client_version(), "9.9.9")
+        self.cache_path.with_name("handshake.json").unlink()
+        with (
+            mock.patch.object(client, "_VERSION", None),
+            mock.patch.object(client, "_installed_client_version", return_value=None),
+        ):
+            self.assertEqual(client.client_version(), client.OPENCODE_VERSION)
+
+    def test_version_floor_from_the_relay_is_adopted_and_retried_once(self):
+        """A 426 names the minimum the relay now serves: adopt it, and the retry carries it."""
+        attempts = []
+
+        def fake_open(request, timeout):
+            attempts.append(request)
+            if len(attempts) == 1:
+                raise urllib.error.HTTPError(  # type: ignore[arg-type]
+                    client.DIRECT_URL,
+                    426,
+                    "upgrade required",
+                    {},
+                    io.BytesIO(
+                        b'{"error":{"message":"client 3.1.0 or newer is required"}}'
+                    ),
+                )
+            return sse(
+                {"model": "m", "choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}
+            )
+
+        with (
+            mock.patch.object(client, "_VERSION", None),
+            mock.patch.object(client, "_installed_client_version", return_value=None),
+            mock.patch.object(client, "_urlopen", side_effect=fake_open),
+        ):
+            response = client.OpenCodeClient().chat.completions.create(
+                model="m", messages=[{"role": "user", "content": "probe"}], tools=[]
+            )
+        self.assertEqual(response.choices[0].message.content, "ok")
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(
+            attempts[0].get_header("User-agent"), f"opencode/{client.OPENCODE_VERSION}"
+        )
+        self.assertEqual(attempts[1].get_header("User-agent"), "opencode/3.1.0")
+        # Kept for the next process, not just this call.
+        handshake = json.loads(self.cache_path.with_name("handshake.json").read_text())
+        self.assertEqual(handshake["floor"], "3.1.0")
+
+    def test_free_tier_refusal_with_an_unchanged_envelope_is_recorded_not_retried(self):
+        """Identical bytes get no in-process retry; the host's policy owns that, and we leave evidence.
+
+        The refusal is the relay's verdict on bytes this client built, and the host that built them
+        (the gateway) may carry a module nobody can reach into — so the record on disk is what a
+        later reader gets, and it carries the request's shape rather than its conversation.
+        """
+        refusal = json.dumps(
+            {
+                "type": "error",
+                "error": {
+                    "type": "FreeTierError",
+                    "message": "OpenCode's free tier can only be used from within OpenCode.",
+                },
+            }
+        )
+        attempts = []
+
+        def fake_open(request, timeout):
+            attempts.append(request)
+            raise urllib.error.HTTPError(  # type: ignore[arg-type]
+                client.DIRECT_URL, 403, "forbidden", {}, io.BytesIO(refusal.encode())
+            )
+
+        with (
+            mock.patch.object(client, "_VERSION", None),
+            mock.patch.object(client, "_installed_client_version", return_value=None),
+            mock.patch.object(client, "_urlopen", side_effect=fake_open),
+        ):
+            with self.assertRaises(client.OpenCodeError) as caught:
+                client.OpenCodeClient().chat.completions.create(
+                    model="deepseek-v4.1-flash-free",
+                    messages=[{"role": "user", "content": "a secret prompt"}],
+                    tools=[],
+                )
+        self.assertEqual(caught.exception.status_code, 403)
+        self.assertEqual(len(attempts), 1)
+        record = json.loads(
+            self.cache_path.with_name(client.REFUSAL_LOG).read_text().splitlines()[-1]
+        )
+        self.assertEqual(record["status"], 403)
+        self.assertIn("FreeTierError", record["response"])
+        self.assertEqual(record["url"], client.DIRECT_URL)
+        self.assertEqual(record["body"]["model"], "deepseek-v4.1-flash-free")
+        self.assertEqual(record["body"]["tools"][:3], ["bash", "edit", "glob"])
+        self.assertTrue(record["body"]["sha256"])
+        self.assertEqual(
+            sorted(record["body"]),
+            [
+                "bytes",
+                "keys",
+                "max_tokens",
+                "messages",
+                "model",
+                "reasoning_effort",
+                "sha256",
+                "tools",
+            ],
+        )
+        self.assertNotIn("a secret prompt", json.dumps(record))
+
+    def test_free_tier_refusal_retries_once_when_the_derived_version_moved(self):
+        """A refusal is the signal to stop trusting the cached version; a changed envelope retries."""
+        attempts = []
+
+        def fake_open(request, timeout):
+            attempts.append(request)
+            if len(attempts) == 1:
+                raise urllib.error.HTTPError(  # type: ignore[arg-type]
+                    client.DIRECT_URL, 403, "forbidden", {}, io.BytesIO(b'{"type":"FreeTierError"}')
+                )
+            return sse(
+                {"model": "m", "choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}
+            )
+
+        with (
+            mock.patch.object(client, "_VERSION", None),
+            mock.patch.object(
+                client, "_installed_client_version", side_effect=["2.0.5", "2.9.0"]
+            ),
+            mock.patch.object(client, "_urlopen", side_effect=fake_open),
+        ):
+            response = client.OpenCodeClient().chat.completions.create(
+                model="m", messages=[{"role": "user", "content": "probe"}], tools=[]
+            )
+        self.assertEqual(response.choices[0].message.content, "ok")
+        self.assertEqual(
+            [attempt.get_header("User-agent") for attempt in attempts],
+            ["opencode/2.0.5", "opencode/2.9.0"],
+        )
+        self.assertNotEqual(
+            attempts[0].get_header("X-opencode-session"),
+            attempts[1].get_header("X-opencode-session"),
+        )
 
     def test_usage_carries_the_reasoning_token_detail_hermes_reads(self):
         """Hermes reads thinking tokens from ``completion_tokens_details`` (usage_pricing.py:654).
@@ -1079,7 +1312,7 @@ class ClientTests(unittest.TestCase):
         )
         self.assertTrue(
             all(
-                call.args[0].headers["User-agent"] == client.OPENCODE_USER_AGENT
+                call.args[0].headers["User-agent"] == client.user_agent()
                 for call in opened.call_args_list
             )
         )
