@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
+import re
 import secrets
 import string
+import subprocess
 import threading
 import time
 import urllib.error
@@ -19,18 +22,32 @@ import urllib.request
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 
 from hermes_constants import get_hermes_home  # type: ignore[import-not-found]
 
+#: The free tier's path. ``models.opencode.ai/api.json`` publishes
+#: ``https://opencode.ai/inference/openai/v1`` for the same provider — that is the AI-SDK base, a
+#: different path that also serves a free-tier call today; the pinned one is the path verified end to
+#: end against the live relay, so it stays pinned rather than re-derived from a catalogue that
+#: describes another client.
 DIRECT_URL = "https://opencode.ai/inference/v1/chat/completions"
 RESPONSES_URL = "https://opencode.ai/inference/v1/responses"
 MODELS_URL = "https://opencode.ai/inference/v1/models"
 MODELS_DEV_URL = "https://models.dev/api.json"
 LOGICAL_BASE_URL = DIRECT_URL
+#: The version this client's User-Agent claims. Pinned only as a FLOOR and a fallback: the value
+#: actually sent is derived (``client_version``), because the relay raises the minimum it serves
+#: without notice — a pinned number is a latent break, and re-deriving it is the fix when it ages.
 OPENCODE_VERSION = "2.0.5"
-# The relay accepts only a bare "opencode/<semver>" User-Agent. The official
-# client's own "opencode/latest/<ver>/cli" form is rejected with FreeTierError.
+#: The official client, asked for its own version. It is the client the relay is built to serve and it
+#: updates itself, so its number tracks the relay's floor.
+OPENCODE_CLI = "opencode"
+#: How long a derived version is trusted before the installed client is asked again.
+VERSION_CHECK_TTL = 6 * 3600.0
+#: The relay accepts only a bare "opencode/<semver>" User-Agent; the official client's own
+#: "opencode/latest/<ver>/cli" form is refused with FreeTierError, so we copy its *number*, never its
+#: string. This constant is the last-resort fallback when nothing can be derived.
 OPENCODE_USER_AGENT = f"opencode/{OPENCODE_VERSION}"
 DEFAULT_MODEL = "big-pickle"
 FALLBACK_MODELS = (
@@ -216,6 +233,10 @@ _SESSION_LOCK = threading.Lock()
 _SESSION_COUNTER = 0
 _MODEL_SNAPSHOT: tuple[str, ...] | None = None
 _MODEL_SNAPSHOT_LOCK = threading.Lock()
+#: The version resolved for this process (see ``client_version``); None until first resolved.
+_VERSION: str | None = None
+#: The lock guarding the handshake file and the version resolved from it (one file, one writer).
+_HANDSHAKE_LOCK = threading.Lock()
 #: Per-model ``limit`` metadata for the free models (models.dev rows, keyed by model id).
 _CATALOG_LIMITS: dict[str, dict[str, int]] = {}
 
@@ -238,6 +259,70 @@ def _status_error(code: int, body: str, context: str) -> OpenCodeError:
     exc = OpenCodeError(f"{context} failed with HTTP {code}: {body[:500]}")
     exc.status_code = code
     return exc
+
+
+#: This provider's own refusal log, beside the model cache. A refusal is decided by bytes a host
+#: process built, and a host that has been running since before a fix keeps the module it imported —
+#: so the refusal has to stay readable from disk afterwards, with no way to reach into that process.
+REFUSAL_LOG = "refusals.jsonl"
+#: How many refusals are kept; the file is rewritten with the newest few, so it cannot grow.
+REFUSAL_LOG_LINES = 20
+
+
+def _request_shape(request: urllib.request.Request) -> dict[str, Any]:
+    """What was sent, as shape rather than content: the tick in a wire dispute, without the text."""
+    raw = getattr(request, "data", None)
+    encoded = bytes(raw) if isinstance(raw, (bytes, bytearray)) else b""
+    try:
+        body = json.loads(encoded.decode("utf-8", "replace") or "{}")
+    except ValueError:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    raw_tools = body.get("tools")
+    tools = raw_tools if isinstance(raw_tools, list) else []
+    return {
+        "url": request.full_url,
+        "headers": dict(request.headers),
+        "body": {
+            "model": body.get("model"),
+            "keys": sorted(body),
+            "tools": [
+                str((item.get("function") or {}).get("name") or "")
+                for item in tools
+                if isinstance(item, dict)
+            ],
+            "messages": len(body.get("messages") or []),
+            "max_tokens": body.get("max_tokens"),
+            "reasoning_effort": body.get("reasoning_effort"),
+            "bytes": len(encoded),
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+        },
+    }
+
+
+def _record_refusal(
+    status: int, response: str, request: urllib.request.Request | None = None
+) -> None:
+    """Append a refused call to this provider's own log, newest last, keeping the last few.
+
+    Never raises: a diagnostic must not be able to turn one refusal into two.
+    """
+    try:
+        path = _model_cache_path().with_name(REFUSAL_LOG)
+        entry: dict[str, Any] = {
+            "timestamp": time.time(),
+            "status": status,
+            "response": str(response or "")[:2000],
+        }
+        if request is not None:
+            entry.update(_request_shape(request))
+        previous = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+        lines = [*previous[-(REFUSAL_LOG_LINES - 1) :], json.dumps(entry)]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except (OSError, TypeError, ValueError):
+        pass
 
 
 def _urlopen(request: urllib.request.Request, timeout: float):
@@ -300,14 +385,30 @@ def classify_api_error(
 #: it cannot settle a dispute about the wire. Set this to capture what was actually sent.
 ENVELOPE_CAPTURE_ENV = "HERMES_OC_DEBUG"
 
+#: Name of the marker file, inside this provider's cache directory, that arms a capture from disk.
+#: A long-lived host (the gateway) imports this module once and re-imports nothing, so its
+#: environment can never be changed afterwards and the env var alone cannot arm a capture there;
+#: a file it can see can. Its content is the destination path, or empty for ``envelopes.jsonl``.
+CAPTURE_ARM_FILE = "capture"
+
+
+def _armed_capture_path() -> str | None:
+    """The capture destination named by the cache-dir marker file, or None when not armed."""
+    try:
+        marker = _model_cache_path().with_name(CAPTURE_ARM_FILE)
+        destination = marker.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return destination or str(marker.with_name("envelopes.jsonl"))
+
 
 def _capture_envelope(request: urllib.request.Request) -> None:
-    """Append *request* as one JSON line to ``$HERMES_OC_DEBUG`` when that names a file.
+    """Append *request* as one JSON line to the armed capture file.
 
     Called from the single place that builds a request, so the capture and the wire can never drift.
     Never raises: a diagnostic must not be able to fail an inference call.
     """
-    path = os.environ.get(ENVELOPE_CAPTURE_ENV)
+    path = os.environ.get(ENVELOPE_CAPTURE_ENV) or _armed_capture_path()
     if not path:
         return
     try:
@@ -332,7 +433,7 @@ def _inference_request(url: str, body: dict[str, Any], session: str) -> urllib.r
             "Authorization": "Bearer public",
             "Content-Type": "application/json",
             "Accept": "text/event-stream",
-            "User-Agent": OPENCODE_USER_AGENT,
+            "User-Agent": user_agent(),
             "x-opencode-session": session,
         },
     )
@@ -345,45 +446,104 @@ def _sse_events(
     timeout: float,
     *,
     owner: "OpenCodeClient | None" = None,
+    recover: "Callable[[int, str, urllib.request.Request], urllib.request.Request | None] | None" = None,
 ) -> Iterator[dict[str, Any]]:
     """Open *request* and yield its ``data:`` payloads until ``[DONE]``.
 
     With *owner*, the live response is registered with that client so its ``close()`` can abort this
     read from another thread — which is how an interrupt or a restart releases the request.
+
+    With *recover*, a refused call is offered to it once: the relay's checks and its request
+    vocabulary move without notice, and a refusal *they* caused is a retry with a re-derived
+    envelope rather than the end of the turn. Whatever it returns is sent instead; None (or a second
+    refusal) raises, and every refusal is recorded either way.
     """
-    try:
-        response = _urlopen(request, timeout)
-    except urllib.error.HTTPError as exc:
-        body_text = exc.read().decode("utf-8", "replace")
-        raise _status_error(exc.code, body_text, INFERENCE_CONTEXT) from exc
-    except urllib.error.URLError as exc:
-        raise OpenCodeError(f"{INFERENCE_CONTEXT} failed: {exc.reason}") from exc
-    tracked = owner._track_inflight(response) if owner is not None else contextlib.nullcontext()
-    with response, tracked:
+    retried = False
+    while True:
         try:
-            for raw_line in response:
-                if owner is not None and owner.is_closed:
-                    raise OpenCodeError("OpenCode client was closed mid-request.")
-                line = raw_line.decode("utf-8", "replace").strip()
-                if not line.startswith("data:"):
+            response = _urlopen(request, timeout)
+        except urllib.error.HTTPError as exc:
+            body_text = exc.read().decode("utf-8", "replace")
+            _record_refusal(exc.code, body_text, request)
+            if recover is not None and not retried:
+                retried = True
+                if replacement := recover(exc.code, body_text, request):
+                    request = replacement
                     continue
-                payload = line[5:].strip()
-                if payload == "[DONE]":
-                    return
-                if payload:
-                    yield json.loads(payload)
-        except (OSError, ValueError) as exc:
-            # ``close()`` aborts a blocked read from a stranger thread, so the reader sees a closed
-            # file: that is an abort, not a provider failure.
-            if owner is not None and owner.is_closed:
-                raise OpenCodeError("OpenCode client was closed mid-request.") from exc
-            raise
+            raise _status_error(exc.code, body_text, INFERENCE_CONTEXT) from exc
+        except urllib.error.URLError as exc:
+            raise OpenCodeError(f"{INFERENCE_CONTEXT} failed: {exc.reason}") from exc
+        tracked = owner._track_inflight(response) if owner is not None else contextlib.nullcontext()
+        with response, tracked:
+            try:
+                for raw_line in response:
+                    if owner is not None and owner.is_closed:
+                        raise OpenCodeError("OpenCode client was closed mid-request.")
+                    line = raw_line.decode("utf-8", "replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    payload = line[5:].strip()
+                    if payload == "[DONE]":
+                        return
+                    if payload:
+                        yield json.loads(payload)
+            except (OSError, ValueError) as exc:
+                # ``close()`` aborts a blocked read from a stranger thread, so the reader sees a closed
+                # file: that is an abort, not a provider failure.
+                if owner is not None and owner.is_closed:
+                    raise OpenCodeError("OpenCode client was closed mid-request.") from exc
+                raise
+        return
+
+
+def _retry_with(url: str, body: dict[str, Any]) -> urllib.request.Request:
+    """The rebuilt request a recovery sends: the same call, with a session id of its own."""
+    return _inference_request(url, body, _session_id())
+
+
+def _refusal_recovery(
+    url: str, body: dict[str, Any], model: str
+) -> "Callable[[int, str, urllib.request.Request], urllib.request.Request | None]":
+    """The recovery a refused call gets: re-derive whatever the relay moved, then retry it once.
+
+    Three refusals are the relay's side moving rather than ours, and each has one honest answer:
+
+    * a ``426`` names a version floor we are under → adopt it and re-derive the User-Agent;
+    * a ``403 FreeTierError`` is its verdict on a request that no longer looks like the official
+      client → re-derive the version, and retry only when that produced a different envelope
+      (identical bytes get no second shot in-process; a burst of those is the host's retry policy's
+      job, and the AGENTS.md gate notes say so);
+    * a ``400 [unsupported_value]`` names a dial this model no longer takes → drop it, remember it.
+
+    Anything else returns None and is raised as it stands.
+    """
+
+    def recover(
+        status: int, response: str, request: urllib.request.Request
+    ) -> urllib.request.Request | None:
+        if status == 426:
+            return _retry_with(url, body) if adopt_version_floor(response) else None
+        if status == 403 and FREE_TIER_REFUSAL.lower() in response.lower():
+            # A refusal is the one signal that says to stop trusting the cached version: the relay
+            # moves its floor without notice, and the installed client is where the new one is.
+            before = client_version()
+            return _retry_with(url, body) if client_version(refresh=True) != before else None
+        if status == 400 and "unsupported_value" in response.lower():
+            effort = body.get("reasoning_effort")
+            if isinstance(effort, str) and effort:
+                _remember_unsupported_effort(model, effort)
+                return _retry_with(
+                    url, {key: value for key, value in body.items() if key != "reasoning_effort"}
+                )
+        return None
+
+    return recover
 
 
 def _json_get(url: str, timeout: float) -> Any:
     request = urllib.request.Request(
         url,
-        headers={"Accept": "application/json", "User-Agent": OPENCODE_USER_AGENT},
+        headers={"Accept": "application/json", "User-Agent": user_agent()},
     )
     with _urlopen(request, timeout) as response:
         return json.load(response)
@@ -494,6 +654,125 @@ def _save_model_cache(models: list[str], limits: dict[str, dict[str, int]]) -> N
             temporary.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+#: Any ``N.N.N`` in a version string the relay or the official client hands us.
+_SEMVER = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+
+
+def _semver(value: Any) -> str | None:
+    """The first ``N.N.N`` in *value* as a normalized string, or None when there is none."""
+    match = _SEMVER.search(str(value or ""))
+    return ".".join(match.groups()) if match else None
+
+
+def _version_key(version: str) -> tuple[int, int, int]:
+    major, minor, patch = version.split(".")
+    return int(major), int(minor), int(patch)
+
+
+def _handshake_path() -> Path:
+    return _model_cache_path().with_name("handshake.json")
+
+
+def _load_handshake() -> dict[str, Any]:
+    """The derived handshake as written by this provider; an unreadable file reads as empty."""
+    try:
+        state = json.loads(_handshake_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _save_handshake(fields: dict[str, Any]) -> None:
+    path = _handshake_path()
+    temporary = path.with_suffix(f".{secrets.token_hex(4)}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(json.dumps(fields) + "\n", encoding="utf-8")
+        temporary.replace(path)
+    except OSError:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _installed_client_version() -> str | None:
+    """The official client's own version, or None when it is absent or will not answer.
+
+    Never raises and never blocks a turn for long: the answer is cached for ``VERSION_CHECK_TTL``,
+    and a host without the CLI falls back to the pinned constant.
+    """
+    try:
+        done = subprocess.run(
+            [OPENCODE_CLI, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return _semver(done.stdout) if done.returncode == 0 else None
+
+
+def client_version(refresh: bool = False) -> str:
+    """The semver this client claims — derived from what is on the host and from the relay's floor.
+
+    The candidates are the pinned constant, the value resolved earlier (cached beside the model
+    cache) and the relay's announced minimum; the highest wins, so the answer never drops below what
+    has already been proven or promised. The official client is asked at most once per
+    ``VERSION_CHECK_TTL`` (and always on *refresh*, which a refusal triggers) — it is the client the
+    relay is built to serve, and it updates itself, so its number is the one that tracks the floor
+    the relay moves.
+    """
+    global _VERSION
+    with _HANDSHAKE_LOCK:
+        if _VERSION is not None and not refresh:
+            return _VERSION
+        state = _load_handshake()
+        candidates = [
+            _semver(OPENCODE_VERSION),
+            _semver(state.get("version")),
+            _semver(state.get("floor")),
+        ]
+        checked = state.get("checked")
+        fresh = (
+            isinstance(checked, (int, float))
+            and not isinstance(checked, bool)
+            and (time.time() - float(checked)) < VERSION_CHECK_TTL
+        )
+        if refresh or not fresh:
+            candidates.append(_installed_client_version())
+        version = max((item for item in candidates if item), key=_version_key)
+        _VERSION = version
+        _save_handshake({**state, "version": version, "checked": time.time()})
+        return version
+
+
+def user_agent() -> str:
+    """The bare ``opencode/<semver>`` the relay accepts, with the current derived version."""
+    return f"opencode/{client_version()}"
+
+
+def adopt_version_floor(text: str) -> str | None:
+    """Adopt a minimum version the relay announced, and return it when that raises the floor.
+
+    A 426 names the minimum client version the relay now serves. Raising the floor is the whole fix
+    for that refusal, so the value is kept and the version re-resolved on the next call.
+    """
+    global _VERSION
+    floor = _semver(text)
+    if floor is None:
+        return None
+    with _HANDSHAKE_LOCK:
+        state = _load_handshake()
+        known = _semver(state.get("floor"))
+        if known and _version_key(known) >= _version_key(floor):
+            return None
+        _save_handshake({**state, "floor": floor})
+        _VERSION = None
+    return floor
 
 
 def _models_for_process(timeout: float) -> tuple[str, ...]:
@@ -747,20 +1026,40 @@ def _effective_timeout(value: Any, default: float = 900.0) -> float:
     )
 
 
-#: The reasoning dial the free models accept, verbatim from the relay's own 400 body.
-_EFFORTS = frozenset({"max", "xhigh", "high", "medium", "low"})
+def _unsupported_efforts(model: str) -> frozenset[str]:
+    """The dial values this model has already answered ``400 [unsupported_value]`` for."""
+    state = _load_handshake()
+    table = state.get("unsupported_efforts")
+    values = table.get(model) if isinstance(table, dict) else None
+    return frozenset(str(item) for item in values) if isinstance(values, list) else frozenset()
 
 
-def _effort(value: Any) -> str | None:
-    """The relay's own effort vocabulary, or None when the host's dial is not in it.
+def _remember_unsupported_effort(model: str, effort: str) -> None:
+    """Remember a dial this model refused, so the same session is not charged for it twice."""
+    with _HANDSHAKE_LOCK:
+        state = _load_handshake()
+        table = state.get("unsupported_efforts")
+        known = dict(table) if isinstance(table, dict) else {}
+        values = {str(item) for item in (known.get(model) or [])}
+        values.add(effort)
+        known[model] = sorted(values)
+        _save_handshake({**state, "unsupported_efforts": known})
 
-    Verified against the live relay: ``reasoning_effort`` accepts only max/xhigh/high/medium/low
-    with these models — ``none`` and ``minimal`` come back HTTP 400 ``unsupported_value`` — so an
-    unsupported dial is dropped rather than forwarded, and the model keeps its own default. The
-    free tier has no thinking-off value, so ``none`` still thinks.
+
+def _reasoning_effort(value: Any, model: str) -> str | None:
+    """The host's reasoning dial, forwarded as it is — the relay owns this vocabulary, not us.
+
+    Measured against the live relay (2026-10-17): ``none`` (thinking off for real — verified by an
+    empty reasoning stream), ``minimal``, ``low``, ``medium``, ``high``, ``max``, ``xhigh`` and even
+    ``ultra`` all stream, where an earlier pass had measured five of them and dropped the rest —
+    including the host's own thinking-off ``none``, which silently kept thinking. So the value is
+    sent rather than filtered, and a ``400 [unsupported_value]`` is what teaches us a model that has
+    narrowed: one retry without the dial, and the value is remembered for that model.
     """
     effort = str(value or "").strip().lower()
-    return effort if effort in _EFFORTS else None
+    if not effort or effort in _unsupported_efforts(model):
+        return None
+    return effort
 
 
 def _namespace(value: Any) -> Any:
@@ -1534,10 +1833,10 @@ class OpenCodeClient:
             "parallel_tool_calls": extra.get("parallel_tool_calls"),
             "response_format": extra.get("response_format"),
             # The provider profile puts the reasoning dial here (top level, never extra_body.reasoning,
-            # whose emission a host allowlist gates). The free models take only the relay's own
-            # vocabulary, so a host dial of ``none``/``minimal`` is dropped rather than forwarded —
-            # verified live: anything else is refused with HTTP 400 ``[unsupported_value]``.
-            "reasoning_effort": _effort(extra.get("reasoning_effort")),
+            # whose emission a host allowlist gates). Which values the models take is the relay's to
+            # decide and it changes: forwarded as it is, and learned from the relay's own 400 (see
+            # ``_reasoning_effort``) rather than filtered against a list that goes stale.
+            "reasoning_effort": _reasoning_effort(extra.get("reasoning_effort"), model),
         }
         body.update(
             {key: value for key, value in optional.items() if value is not None}
@@ -1552,7 +1851,15 @@ class OpenCodeClient:
                 }
             )
         request = _inference_request(DIRECT_URL, body, self._session)
-        return _sse_events(request, timeout, owner=self), mapped_tools
+        return (
+            _sse_events(
+                request,
+                timeout,
+                owner=self,
+                recover=_refusal_recovery(DIRECT_URL, body, model),
+            ),
+            mapped_tools,
+        )
 
     def _responses_events(
         self,
@@ -1615,7 +1922,12 @@ class OpenCodeClient:
             saw_tool_call = False
             call_indexes: dict[int, int] = {}
             selected_model = model
-            for event in _sse_events(request, timeout, owner=self):
+            for event in _sse_events(
+                request,
+                timeout,
+                owner=self,
+                recover=_refusal_recovery(RESPONSES_URL, body, model),
+            ):
                 seen = True
                 kind = str(event.get("type") or "")
                 response = event.get("response") or {}

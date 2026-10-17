@@ -16,8 +16,10 @@ Hermes makes per turn. `README.md` is for the person installing it; this file is
 
 The symbols a change usually touches: `_inference_request` and `_sse_events` (the only place a request is
 built and read), `_session_id` (the relay-validated id), `_wire_tools` and `_translate_tool` (the
-translation pairs, both directions), the `COMPAT_TOOL_*` alias tables, and `_models_for_process`
-(discovery with its cache and fallback chain).
+translation pairs, both directions), the `COMPAT_TOOL_*` alias tables, `_models_for_process` (discovery
+with its cache and fallback chain), and the handshake pair `client_version` (what the User-Agent claims,
+derived) with `_refusal_recovery` / `_record_refusal` (what a refusal re-derives, and what it leaves
+behind).
 
 ## Commands
 
@@ -47,6 +49,16 @@ looks exactly like a broken fix: the old failure survives code that is correct o
 host serves every profile, and `hermes -z` is a *client* of it (`hermes_cli/gateway_chat.py`): the
 acceptance check below therefore runs the gateway's in-memory module, never the file you just edited, so
 restart the host gateway before concluding anything from it.
+
+The same trap runs the other way, and it is the expensive one: a host that has been up for hours can be
+refused while a fresh process streams *byte-identical* requests in the same minute. Before bisecting the
+wire, replay the failing turn's own `request_dump_local-*.json` body through the plugin's client in a fresh
+process — if that streams `200`, the envelope is right and the host process is what to restart. A refusal
+writes itself down for exactly this: `<hermes home>/cache/oc-free-provider/refusals.jsonl` holds the last
+20, each with its status, the relay's own words, and the refused request's *shape* (URL, headers, model,
+tool names, byte count, body hash — never the conversation). Set `HERMES_OC_DEBUG=<file>` for the full
+bytes, or leave a file at `<hermes home>/cache/oc-free-provider/capture` to arm the same capture from disk
+in a host whose environment cannot be changed after it starts.
 
 ## Git
 
@@ -85,13 +97,28 @@ Undocumented, enforced per request, and moved without notice. All four were veri
 on 2026-10-15:
 
 1. Base URL `https://opencode.ai/inference/v1` for `/chat/completions`, `/responses` and `/models`. The
-   older `/zen/v1` answers `FreeTierError` for every shape.
-2. `User-Agent: opencode/<semver>`, bare. Extra segments fail.
+   older `/zen/v1` answers `FreeTierError` for every shape. `models.opencode.ai/api.json` publishes
+   `.../inference/openai/v1` for the same provider — the AI-SDK base, which serves a free-tier call today
+   but is not the path verified end to end, so it is deliberately not adopted.
+2. `User-Agent: opencode/<semver>`, bare. Extra segments fail. The number is *derived*
+   (`client_version`), never just the pinned constant: the highest of the pin, the last resolved value, the
+   installed official client's own version, and any floor the relay announced with a `426`. A semver below
+   the relay's floor is a separate refusal, and a pinned number is a latent break.
 3. `x-opencode-session: ses_` then the low 48 bits of `~(ms * 4096 + counter)` as 6 big-endian bytes in
    hex, then 14 base62 characters. The inversion is what makes ids sort newest-first; without it the relay
-   refuses the id.
+   refuses the id. Rebuilt only on a retry after a refusal — an id a client reuses keeps the relay's prompt
+   cache warm.
 4. Every advertised tool carries a non-empty parameter schema. An alias whose Hermes tool is missing still
    needs OpenCode's real schema, which is why `_compat_tool` uses `COMPAT_TOOL_PARAMETERS`.
+
+The reasoning dial is the relay's vocabulary too, and it moves in both directions: measured 2026-10-17,
+`none` (thinking off for real), `minimal`, `low`, `medium`, `high`, `max`, `xhigh` and `ultra` all stream,
+where an earlier pass had measured five of them and dropped the rest — including the host's own
+thinking-off `none`, which silently kept thinking. So the dial is forwarded as it is and a
+`400 [unsupported_value]` is what teaches us a model that has narrowed: one retry without it, remembered
+per model in `handshake.json`. A refusal from any of these causes is re-derived once inside the call
+(`_refusal_recovery`) and then left to Hermes' retry policy — a 403 with an *unchanged* envelope is not
+retried in-process, because the gate refuses identical bytes in bursts and that is the host's business.
 
 To re-derive these after a change, capture rather than guess: point the official CLI's provider `baseURL`
 at a local catch-proxy through `OPENCODE_CONFIG`, record the request it sends, then replay it against the
