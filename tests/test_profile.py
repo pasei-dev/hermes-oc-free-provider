@@ -115,15 +115,25 @@ class CatalogLimitTests(unittest.TestCase):
         self.client._CATALOG_LIMITS.update(self._saved)
 
     def test_the_paid_siblings_window_never_leaks_in(self):
-        # Hermes' family fallback reads the paid `deepseek-v4.1-flash` row (1000000) for this id.
-        self.assertEqual(
-            plugin.opencode_free.get_model_context_length("deepseek-v4.1-flash-free"), 200000
-        )
         self.assertEqual(
             plugin.opencode_free.get_model_context_length("muse-spark-1.3-contributor-free"),
             1048576,
         )
         self.assertIsNone(plugin.opencode_free.get_model_context_length("not-in-the-catalog"))
+
+    def test_a_measured_window_beats_the_published_row(self):
+        """The relay serves ~419K for this id although the free tier's row publishes 200K.
+
+        Hermes' family fallback would read the paid `deepseek-v4.1-flash` row (1000000), so the
+        measured value has to come from this provider's own table rather than from either guess.
+        """
+        self.assertEqual(
+            self.client.served_context("deepseek-v4.1-flash-free"), 410000
+        )
+        self.assertEqual(
+            plugin.opencode_free.get_model_context_length("deepseek-v4.1-flash-free"), 410000
+        )
+        self.assertIsNone(self.client.served_context("big-pickle"))
 
     def test_the_output_cap_comes_from_the_catalog(self):
         self.assertEqual(

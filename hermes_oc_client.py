@@ -928,6 +928,26 @@ def _models_for_process(timeout: float) -> tuple[str, ...]:
         return _MODEL_SNAPSHOT
 
 
+#: Context windows the relay serves that differ from the model's models.dev row. The catalog carries
+#: the free tier's *documented* window; the relay enforces its own, and for the id below it is more
+#: than twice the published row. Measured 2026-10-20 by filling a real request in this envelope
+#: (eleven tools advertised) until the relay answered `400 context_length_exceeded`:
+#: ``deepseek-v4.1-flash-free`` served a 418,894-token prompt and refused one a few dozen tokens
+#: larger, where the catalog row says 200,000 — so the meter and the compressor were discarding more
+#: than half the window. The value kept here sits under the measured ceiling on purpose: an
+#: over-reported window costs a failed turn, while under-reporting only costs context. The ceiling
+#: counts the prompt alone (a 410,193-token prompt with ``max_tokens: 32000`` is served), so the
+#: output cap does not eat into it.
+SERVED_CONTEXT: dict[str, int] = {
+    "deepseek-v4.1-flash-free": 410_000,
+}
+
+
+def served_context(model: str | None) -> int | None:
+    """The measured context window for *model*, or None when its catalog row is the best we have."""
+    return SERVED_CONTEXT.get(str(model)) if model else None
+
+
 def catalog_limit(model: str | None, key: str) -> int | None:
     """A free model's own catalog ``limit`` (``context``/``output``), or None while cold.
 

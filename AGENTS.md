@@ -100,8 +100,8 @@ Never
 
 ## The relay's checks
 
-Undocumented, enforced per request, and moved without notice. All five were verified against the live relay,
-items 1–4 on 2026-10-15 and item 5 on 2026-10-17:
+Undocumented, enforced per request, and moved without notice. All six were verified against the live relay,
+items 1–4 on 2026-10-15, item 5 on 2026-10-17 and item 6 on 2026-10-20:
 
 1. Base URL `https://opencode.ai/inference/v1` for `/chat/completions`, `/responses` and `/models`. The
    older `/zen/v1` answers `FreeTierError` for every shape. `models.opencode.ai/api.json` publishes
@@ -120,6 +120,12 @@ items 1–4 on 2026-10-15 and item 5 on 2026-10-17:
 5. The tool list is never empty: a body that advertises no tools is refused `403 FreeTierError`, identically
    to a malformed one — the two are the same refusal, which is what makes a tool-less body the cheapest way
    to *measure* the gate without burning a real turn.
+6. The window it enforces is the relay's own, not the model's models.dev row: measured 2026-10-20, a
+   `deepseek-v4.1-flash-free` prompt of 418,894 tokens is served and a few dozen tokens more is refused
+   `400 context_length_exceeded`, where the catalog row publishes 200,000. The ceiling counts the prompt
+   alone, so `max_tokens` does not eat into it, and it is what `SERVED_CONTEXT` records (`served_context()`
+   walks past the catalog row). A `503 Endpoint is unavailable` is a flaky upstream, not a length verdict:
+   the same bytes are served on the next attempt, so retry before believing any measurement from it.
 
 The reasoning dial is the relay's vocabulary too, and it moves in both directions: measured 2026-10-17,
 `none` (thinking off for real), `minimal`, `low`, `medium`, `high`, `max`, `xhigh` and `ultra` all stream,
