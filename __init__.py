@@ -22,6 +22,7 @@ FALLBACK_MODELS = hermes_oc_client.FALLBACK_MODELS
 LOGICAL_BASE_URL = hermes_oc_client.LOGICAL_BASE_URL
 OpenCodeClient = hermes_oc_client.OpenCodeClient
 catalog_limit = hermes_oc_client.catalog_limit
+served_context = hermes_oc_client.served_context
 
 from providers import register_provider  # type: ignore[import-not-found]
 from providers.base import ProviderProfile  # type: ignore[import-not-found]
@@ -73,14 +74,19 @@ class OpenCodeFreeProfile(ProviderProfile):
         return {}, {"reasoning_effort": effort if effort in _REASONING_EFFORTS else "medium"}
 
     def get_model_context_length(self, model: str | None) -> int | None:
-        """The free model's own catalog window.
+        """The window the relay actually serves for this free model.
 
         Hermes cannot resolve this provider name against the catalog, and its family fallback is
         wrong for these ids — it reads the paid sibling's window (1M for `deepseek-v4.1-flash-free`,
         256K default for `big-pickle`). This hook is checked before those guesses, so the meter and
         the compressor agree with what the official OpenCode routes show.
+
+        Where the relay enforces more than the free tier's published row, the measured window wins
+        (see ``SERVED_CONTEXT``): `deepseek-v4.1-flash-free` serves a prompt of 418,894 tokens
+        although models.dev publishes 200,000, so the published row would compact a turn at less
+        than half its real room.
         """
-        return catalog_limit(model, "context")
+        return served_context(model) or catalog_limit(model, "context")
 
     def get_max_tokens(self, model: str | None) -> int | None:
         """The catalog's output cap for the model; the relay serves no limit metadata of its own."""
